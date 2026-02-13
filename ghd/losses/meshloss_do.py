@@ -4,7 +4,7 @@ import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from pytorch3d.loss import chamfer_distance,mesh_laplacian_smoothing, mesh_normal_consistency, mesh_edge_loss
 from pytorch3d.ops import sample_points_from_meshes, cot_laplacian, padded_to_packed
-from .meshloss import Mesh_loss
+from ghd.losses.meshloss import Mesh_loss
 from ghd.fitting.registration import RegistrationwOpeningAlignment
 import torch
 from pytorch3d.structures import Meshes
@@ -13,7 +13,7 @@ from pytorch3d.loss import chamfer_distance
 from torch.utils.data.dataset import TensorDataset
 from torch.utils.data import DataLoader
 from ghd.base.mesh_geometry3 import Winding_Occupancy
-from .diceloss import BinaryDiceLoss, BinaryDiceLoss_Weighted
+from ghd.losses.diceloss import BinaryDiceLoss, BinaryDiceLoss_Weighted
 import math
 import pyvista as pv
 import trimesh
@@ -164,32 +164,36 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         points_path = os.path.join(self.root_target, self.name_target, "do_points.pt")
         if not os.path.exists(points_path) or redo:
             print("do_points no found, redoing points searching")
-            for batch in range(1000):
+            query_points_in = torch.empty((0, 3)).float()
+            query_points_out = torch.empty((0, 3)).float()
+            loop_idx = 0
+            while True:
+                loop_idx += 1
                 x = np.random.uniform(bound_box[0, 0], bound_box[0, 1], size=batch_size)
                 y = np.random.uniform(bound_box[1, 0], bound_box[1, 1], size=batch_size)
                 z = np.random.uniform(bound_box[2, 0], bound_box[2, 1], size=batch_size)
                 query_points = torch.tensor(np.stack([x, y, z], axis=1)).float()
-                do_gt = torch.sigmoid((Winding_Occupancy(self.target_mesh.to(device), query_points) - 0.5) * 100)
+                
+                # Checking winding number magnitude to handle inverted normals
+                winding_val = Winding_Occupancy(self.target_mesh.to(device), query_points)
+                # Using .abs() because some meshes might have inverted normals (winding ~ -1)
+                do_gt = torch.sigmoid((winding_val.abs() - 0.5) * 100)
                 indices_in = torch.where(do_gt > 0.95)[0]
                 indices_out = torch.where(do_gt < 0.05)[0]
                 if count_num_in <= expand_ratio * num_in:
                     count_num_in += indices_in.shape[0]
-                    if batch == 0:
-                        query_points_in = query_points[indices_in, :]
-                    else:
-                        query_points_in = torch.cat((query_points_in, query_points[indices_in, :]), dim=0)
+                    query_points_in = torch.cat((query_points_in, query_points[indices_in, :]), dim=0)
+
                 if count_num_out <= expand_ratio * num_out:
                     count_num_out += indices_out.shape[0]
-                    if batch == 0:
-                        query_points_out = query_points[indices_out, :]
-                    else:
-                        query_points_out = torch.cat((query_points_out, query_points[indices_out, :]), dim=0)
+                    query_points_out = torch.cat((query_points_out, query_points[indices_out, :]), dim=0)
+
                 print("{} and {} points have been founded for static dc registration.\n".format(count_num_in, count_num_out))
                 if count_num_in >= expand_ratio * num_in and count_num_out >= expand_ratio * num_out:
                     break
             # calculate field strength
-            query_points_in = torch.Tensor(query_points_in)[: expand_ratio * num_in, :]
-            query_points_out = torch.Tensor(query_points_out)[: expand_ratio * num_out, :]
+            query_points_in = query_points_in[: expand_ratio * num_in, :]
+            query_points_out = query_points_out[: expand_ratio * num_out, :]
             torch.save({'query_points_in': query_points_in, 'query_points_out': query_points_out}, points_path)
         else:
             print("do points successfully loaded!")
@@ -199,10 +203,26 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         # query_points_in, query_points_out = dict_pt['query_points_in'], dict_pt['query_points_out0']
         source_verts = torch.cat((self.mesh_std.verts_packed().detach().cpu().float(),
                                           self.target_mesh.verts_packed().detach().cpu().float()), dim=0)
-        distance_in = torch.norm(source_verts.unsqueeze(1) - query_points_in.unsqueeze(0), dim=2) + smooth
-        distance_out = torch.norm(source_verts.unsqueeze(1) - query_points_out.unsqueeze(0), dim=2) + smooth
-        strength_in = torch.sum((1 / torch.pow(distance_in, 2)), dim=0)
-        strength_out = torch.sum((1 / torch.pow(distance_out, 2)), dim=0)
+        
+        # Batch processing to avoid OOM
+        batch_size = 1000
+        strength_in_list = []
+        for i in range(0, query_points_in.shape[0], batch_size):
+             qp_batch = query_points_in[i:i + batch_size]
+             # cdist handles efficient distance calculation
+             d_batch = torch.cdist(source_verts.unsqueeze(0), qp_batch.unsqueeze(0)).squeeze(0) + smooth
+             s_batch = torch.sum((1 / torch.pow(d_batch, 2)), dim=0)
+             strength_in_list.append(s_batch)
+        strength_in = torch.cat(strength_in_list, dim=0) if len(strength_in_list) > 0 else torch.tensor([])
+
+        strength_out_list = []
+        for i in range(0, query_points_out.shape[0], batch_size):
+             qp_batch = query_points_out[i:i + batch_size]
+             d_batch = torch.cdist(source_verts.unsqueeze(0), qp_batch.unsqueeze(0)).squeeze(0) + smooth
+             s_batch = torch.sum((1 / torch.pow(d_batch, 2)), dim=0)
+             strength_out_list.append(s_batch)
+        strength_out = torch.cat(strength_out_list, dim=0) if len(strength_out_list) > 0 else torch.tensor([])
+
         strength = torch.cat((strength_in, strength_out), dim=0)
         _, topk_indices_in = torch.topk(strength_in, num_in)
         _, topk_indices_out = torch.topk(strength_out, num_out)

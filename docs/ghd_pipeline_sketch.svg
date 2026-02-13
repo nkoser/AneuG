@@ -1,0 +1,128 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980">
+  <defs>
+    <style>
+      .title { font: 700 34px 'DejaVu Sans', Arial, sans-serif; fill: #1a1a1a; }
+      .subtitle { font: 600 20px 'DejaVu Sans', Arial, sans-serif; fill: #1a1a1a; }
+      .label { font: 500 17px 'DejaVu Sans', Arial, sans-serif; fill: #222; }
+      .small { font: 500 15px 'DejaVu Sans', Arial, sans-serif; fill: #333; }
+      .tiny { font: 500 14px 'DejaVu Sans', Arial, sans-serif; fill: #444; }
+      .box { stroke: #2f2f2f; stroke-width: 2; rx: 12; ry: 12; }
+      .phase1 { fill: #edf7ff; }
+      .phase2 { fill: #f3fff1; }
+      .artifact { fill: #fff8e7; }
+      .result { fill: #ffeef0; }
+      .arrow { stroke: #303030; stroke-width: 2.4; fill: none; marker-end: url(#arrowhead); }
+      .dashed { stroke-dasharray: 8 8; }
+      .divider { stroke: #999; stroke-width: 2; stroke-dasharray: 6 8; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+      <polygon points="0 0, 10 4, 0 8" fill="#303030"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="980" fill="#fbfcfd"/>
+
+  <text x="40" y="58" class="title">AneuG: Registrierung -> GHD-Morphing (pro Target-Case)</text>
+  <text x="40" y="92" class="subtitle">Skizze: Was wird registriert, warum, und was passiert beim Morphen</text>
+
+  <line x1="800" y1="120" x2="800" y2="940" class="divider"/>
+
+  <text x="70" y="145" class="subtitle">Phase A: Einmalige Registrierung (Constraints erzeugen)</text>
+  <text x="860" y="145" class="subtitle">Phase B: GHD-Fitting (Canonical -> Target)</text>
+
+  <!-- Left: Canonical registration -->
+  <rect x="60" y="190" width="320" height="105" class="box phase1"/>
+  <text x="80" y="230" class="label">Canonical Mesh C</text>
+  <text x="80" y="258" class="small">z.B. checkpoints/alignment/canonical_typeB</text>
+
+  <rect x="60" y="340" width="320" height="180" class="box phase1"/>
+  <text x="80" y="374" class="label">Opening-Registration</text>
+  <text x="80" y="402" class="tiny">1) Punkte auf jeder Opening klicken</text>
+  <text x="80" y="426" class="tiny">2) auf Ebene projizieren</text>
+  <text x="80" y="450" class="tiny">3) clockwise sortieren</text>
+  <text x="80" y="474" class="tiny">4) triangulieren und auf Vertex-IDs mappen</text>
+
+  <rect x="60" y="560" width="320" height="110" class="box artifact"/>
+  <text x="80" y="603" class="label">C/opa_checkpoint.pkl</text>
+  <text x="80" y="631" class="tiny">Opening-Flachen + Indizes + Mapping</text>
+
+  <rect x="60" y="710" width="320" height="170" class="box phase1"/>
+  <text x="80" y="746" class="label">DCE-Registration</text>
+  <text x="80" y="772" class="tiny">1) Branch-Seeds klicken</text>
+  <text x="80" y="796" class="tiny">2) Wave-Casting im Mesh-Graph</text>
+  <text x="80" y="820" class="tiny">3) Loops je Welle speichern</text>
+  <text x="80" y="844" class="tiny">4) ergibt differenzierbare Centreline-Infos</text>
+
+  <rect x="420" y="760" width="320" height="110" class="box artifact"/>
+  <text x="440" y="803" class="label">C/diff_centreline_checkpoint.pkl</text>
+  <text x="440" y="831" class="tiny">Seeds + wave_loops</text>
+
+  <!-- Left: Target registration -->
+  <rect x="420" y="190" width="320" height="105" class="box phase1"/>
+  <text x="440" y="230" class="label">Target Mesh T_i</text>
+  <text x="440" y="258" class="small">z.B. checkpoints/alignment/&lt;case&gt;</text>
+
+  <rect x="420" y="340" width="320" height="180" class="box phase1"/>
+  <text x="440" y="374" class="label">Opening-Registration (gleich wie links)</text>
+  <text x="440" y="402" class="tiny">Klickpunkte -> Ebene -> Sortierung -> Triangulation</text>
+  <text x="440" y="426" class="tiny">+ Mapping auf Original-Vertices vom Target</text>
+
+  <rect x="420" y="560" width="320" height="110" class="box artifact"/>
+  <text x="440" y="603" class="label">T_i/opa_checkpoint.pkl</text>
+  <text x="440" y="631" class="tiny">Target-Opening-Constraints</text>
+
+  <rect x="420" y="710" width="320" height="170" class="box phase1"/>
+  <text x="440" y="746" class="label">DCE-Registration (gleich wie links)</text>
+  <text x="440" y="772" class="tiny">Seeds klicken -> Wave-Casting -> Loops</text>
+  <text x="440" y="796" class="tiny">wird fur Centreline-Loss genutzt</text>
+
+  <rect x="60" y="760" width="320" height="110" class="box artifact"/>
+  <text x="80" y="803" class="label">T_i/diff_centreline_checkpoint.pkl</text>
+  <text x="80" y="831" class="tiny">Target-seitige wave_loops</text>
+
+  <!-- Left arrows -->
+  <line x1="220" y1="295" x2="220" y2="340" class="arrow"/>
+  <line x1="220" y1="520" x2="220" y2="560" class="arrow"/>
+  <line x1="580" y1="295" x2="580" y2="340" class="arrow"/>
+  <line x1="580" y1="520" x2="580" y2="560" class="arrow"/>
+  <line x1="220" y1="670" x2="220" y2="710" class="arrow"/>
+  <line x1="580" y1="670" x2="580" y2="710" class="arrow"/>
+
+  <!-- Right: fitting -->
+  <rect x="860" y="190" width="690" height="120" class="box phase2"/>
+  <text x="885" y="230" class="label">Inputs fur ein Case T_i</text>
+  <text x="885" y="258" class="tiny">Canonical Mesh + Target Mesh + 4 Checkpoints (OPA + DCE fur C und T_i)</text>
+  <text x="885" y="282" class="tiny">-> alles wird geladen, nicht mehr manuell geklickt</text>
+
+  <rect x="860" y="350" width="690" height="160" class="box phase2"/>
+  <text x="885" y="386" class="label">Morphing/Optimierung</text>
+  <text x="885" y="414" class="tiny">Canonical C wird mit Parametern theta deformiert: C -> C_warp(theta)</text>
+  <text x="885" y="438" class="tiny">theta enthalt GHD-Koeffizienten + R/s/T (je nach Modellteil)</text>
+  <text x="885" y="462" class="tiny">Pro Epoch wird Loss berechnet und theta per Optimizer aktualisiert</text>
+  <text x="885" y="486" class="tiny">Ziel: deformiertes Canonical soll zum Target passen</text>
+
+  <rect x="860" y="550" width="690" height="190" class="box phase2"/>
+  <text x="885" y="586" class="label">Loss-Terme (vereinfacht)</text>
+  <text x="885" y="614" class="tiny">1) Globaler Mesh-Loss: C_warp(theta) vs Target-Mesh</text>
+  <text x="885" y="638" class="tiny">2) Opening-Loss: warped Openings vs registrierte Opening-Patches (opa_checkpoint)</text>
+  <text x="885" y="662" class="tiny">3) Centreline-Loss: wave_loops/Centreline von C_warp vs Target (diff_centreline_checkpoint)</text>
+  <text x="885" y="686" class="tiny">4) Zusatzterme: laplacian, edge, rigid, DO ... je nach Config</text>
+  <text x="885" y="714" class="tiny">=> dadurch lernt das Modell nicht nur "irgendeine" Form, sondern anatomisch konsistente</text>
+
+  <rect x="860" y="780" width="690" height="130" class="box result"/>
+  <text x="885" y="818" class="label">Output pro Case</text>
+  <text x="885" y="846" class="tiny">ghb_fitting_checkpoint.pkl</text>
+  <text x="885" y="870" class="tiny">enthlt u.a.: GHD_coefficient  (= deine GHD Tokens), plus R, s, T</text>
+
+  <!-- Right arrows -->
+  <line x1="1205" y1="310" x2="1205" y2="350" class="arrow"/>
+  <line x1="1205" y1="510" x2="1205" y2="550" class="arrow"/>
+  <line x1="1205" y1="740" x2="1205" y2="780" class="arrow"/>
+
+  <!-- Cross-phase handoff -->
+  <path d="M 740 620 C 820 620, 820 250, 860 250" class="arrow dashed"/>
+  <text x="740" y="604" class="tiny">geladene Checkpoints</text>
+
+  <!-- Footer -->
+  <text x="40" y="950" class="small">Hinweis: Registrierung ist i.d.R. einmalig pro Case; danach werden die gespeicherten Checkpoints wiederverwendet.</text>
+</svg>

@@ -34,13 +34,36 @@ class Mesh_loss(nn.Module):
         self.dice_loss = BinaryDiceLoss()
         self.mse_loss = torch.nn.MSELoss()
         self.dice_loss_attention = BinaryDiceLoss_Weighted(weights_normalize=False)  # conservative: not using weights_normalization
+
+    def _safe_sample_points_from_meshes(self, meshes: Meshes, num_samples: int, return_normals: bool = True):
+        """
+        sample_points_from_meshes can fail when a mesh becomes degenerate
+        (e.g., zero/invalid face areas). Fallback to sampled vertices so training
+        can continue instead of crashing.
+        """
+        try:
+            return sample_points_from_meshes(meshes, num_samples, return_normals=return_normals)
+        except Exception as e:
+            print(f"[Mesh_loss] sample_points_from_meshes failed, using vertex fallback: {e}")
+            verts = meshes.verts_padded()
+            B, N, _ = verts.shape
+            idx = torch.randint(0, N, (B, num_samples), device=verts.device)
+            samples = torch.gather(verts, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+            if return_normals:
+                try:
+                    vnormals = meshes.verts_normals_padded()
+                    normals = torch.gather(vnormals, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+                except Exception:
+                    normals = torch.zeros_like(samples)
+                return samples, normals
+            return samples
     
     def forward(self, meshes_scr: Meshes, trg: Union[Meshes, torch.Tensor], loss_list:dict, B=1):
         # calcualte all types of losses for self and meshes_scr
         loss_dict = {}
-        sample_scr, normals_scr = sample_points_from_meshes(meshes_scr,self.sample_num, return_normals=True)
+        sample_scr, normals_scr = self._safe_sample_points_from_meshes(meshes_scr, self.sample_num, return_normals=True)
         if isinstance(trg, Meshes):
-            sample_trg, normals_trg = sample_points_from_meshes(trg,self.sample_num, return_normals=True)
+            sample_trg, normals_trg = self._safe_sample_points_from_meshes(trg, self.sample_num, return_normals=True)
             loss_p0, loss_n1 = chamfer_distance(sample_scr, sample_trg, x_normals=normals_scr, y_normals=normals_trg)
         else:
             sample_trg = trg

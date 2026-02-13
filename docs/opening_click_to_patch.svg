@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="860" viewBox="0 0 1500 860">
+  <defs>
+    <style>
+      .bg { fill: #f7fbff; }
+      .title { font: 700 34px 'DejaVu Sans', Arial, sans-serif; fill: #141414; }
+      .step { font: 700 22px 'DejaVu Sans', Arial, sans-serif; fill: #1f1f1f; }
+      .txt { font: 500 17px 'DejaVu Sans', Arial, sans-serif; fill: #2a2a2a; }
+      .tiny { font: 500 14px 'DejaVu Sans', Arial, sans-serif; fill: #3a3a3a; }
+      .card { stroke: #2e2e2e; stroke-width: 2; rx: 14; ry: 14; }
+      .s1 { fill: #e9f3ff; }
+      .s2 { fill: #edfbee; }
+      .s3 { fill: #fff8e6; }
+      .s4 { fill: #ffeef2; }
+      .mesh { fill: #dce8ff; stroke: #486287; stroke-width: 2; }
+      .plane { fill: #e4ffe8; stroke: #3c7a4a; stroke-width: 2; }
+      .pt { fill: #ff9f1c; stroke: #8e5500; stroke-width: 1.5; }
+      .pt2 { fill: #5ec57f; stroke: #24663c; stroke-width: 1.5; }
+      .edge { stroke: #1f1f1f; stroke-width: 2; fill: none; }
+      .tri { fill: #ffd6a5; stroke: #915f1b; stroke-width: 1.4; }
+      .arrow { stroke: #303030; stroke-width: 2.6; fill: none; marker-end: url(#ah); }
+      .dashed { stroke-dasharray: 8 8; }
+      .idx { font: 600 13px 'DejaVu Sans', Arial, sans-serif; fill: #111; }
+    </style>
+    <marker id="ah" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto">
+      <polygon points="0 0, 12 4, 0 8" fill="#303030"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1500" height="860" class="bg"/>
+  <text x="38" y="54" class="title">Opening Registration: von Mesh-Klicks zum Opening-Patch</text>
+
+  <!-- Step cards -->
+  <rect x="40" y="100" width="335" height="690" class="card s1"/>
+  <rect x="405" y="100" width="335" height="690" class="card s2"/>
+  <rect x="770" y="100" width="335" height="690" class="card s3"/>
+  <rect x="1135" y="100" width="325" height="690" class="card s4"/>
+
+  <!-- Step 1 -->
+  <text x="62" y="142" class="step">1) Klicks auf dem 3D-Mesh</text>
+  <text x="62" y="170" class="txt">Du klickst Randpunkte der Oeffnung</text>
+  <text x="62" y="194" class="txt">direkt auf der Mesh-Oberflaeche.</text>
+
+  <path d="M95,380 C80,300 150,240 220,255 C310,235 350,320 320,390 C340,480 250,560 170,525 C120,530 80,455 95,380 Z" class="mesh"/>
+  <ellipse cx="210" cy="395" rx="60" ry="40" fill="#ffffff" stroke="#4c4c4c" stroke-width="1.8"/>
+  <circle cx="160" cy="388" r="8" class="pt"/>
+  <circle cx="176" cy="360" r="8" class="pt"/>
+  <circle cx="214" cy="350" r="8" class="pt"/>
+  <circle cx="248" cy="362" r="8" class="pt"/>
+  <circle cx="264" cy="390" r="8" class="pt"/>
+  <circle cx="250" cy="420" r="8" class="pt"/>
+  <circle cx="214" cy="435" r="8" class="pt"/>
+  <circle cx="176" cy="422" r="8" class="pt"/>
+  <text x="72" y="620" class="tiny">Diese Punkte sind noch ungeordnet und in 3D.</text>
+  <text x="72" y="642" class="tiny">Kein fertiger Querschnitt - nur manuelle Rand-Annotation.</text>
+
+  <!-- Step 2 -->
+  <text x="427" y="142" class="step">2) Projektion auf Ebene</text>
+  <text x="427" y="170" class="txt">Die geklickten 3D-Punkte werden</text>
+  <text x="427" y="194" class="txt">auf eine lokale Ebene projiziert.</text>
+
+  <polygon points="470,520 675,450 615,280 410,350" class="plane"/>
+  <circle cx="476" cy="420" r="7" class="pt2"/>
+  <circle cx="500" cy="377" r="7" class="pt2"/>
+  <circle cx="552" cy="352" r="7" class="pt2"/>
+  <circle cx="604" cy="372" r="7" class="pt2"/>
+  <circle cx="628" cy="414" r="7" class="pt2"/>
+  <circle cx="607" cy="455" r="7" class="pt2"/>
+  <circle cx="552" cy="478" r="7" class="pt2"/>
+  <circle cx="500" cy="459" r="7" class="pt2"/>
+
+  <line x1="470" y1="520" x2="675" y2="450" class="edge dashed"/>
+  <line x1="675" y1="450" x2="615" y2="280" class="edge dashed"/>
+  <line x1="615" y1="280" x2="410" y2="350" class="edge dashed"/>
+  <line x1="410" y1="350" x2="470" y2="520" class="edge dashed"/>
+  <text x="427" y="620" class="tiny">In 2D/planar sind Sortierung und Triangulation stabiler.</text>
+
+  <!-- Step 3 -->
+  <text x="792" y="142" class="step">3) Clockwise + Triangulation</text>
+  <text x="792" y="170" class="txt">Punkte werden im Uhrzeigersinn sortiert,</text>
+  <text x="792" y="194" class="txt">dann als Polygon trianguliert.</text>
+
+  <polygon points="915,365 962,382 980,426 958,466 912,485 865,468 846,424 867,384" class="edge"/>
+  <polygon points="915,365 962,382 912,485" class="tri"/>
+  <polygon points="962,382 980,426 912,485" class="tri"/>
+  <polygon points="980,426 958,466 912,485" class="tri"/>
+  <polygon points="912,485 865,468 915,365" class="tri"/>
+  <polygon points="865,468 846,424 915,365" class="tri"/>
+  <polygon points="846,424 867,384 915,365" class="tri"/>
+
+  <circle cx="867" cy="384" r="7" class="pt"/>
+  <circle cx="915" cy="365" r="7" class="pt"/>
+  <circle cx="962" cy="382" r="7" class="pt"/>
+  <circle cx="980" cy="426" r="7" class="pt"/>
+  <circle cx="958" cy="466" r="7" class="pt"/>
+  <circle cx="912" cy="485" r="7" class="pt"/>
+  <circle cx="865" cy="468" r="7" class="pt"/>
+  <circle cx="846" cy="424" r="7" class="pt"/>
+
+  <text x="792" y="620" class="tiny">Jetzt gibt es einen echten Opening-Patch (Dreiecke).</text>
+
+  <!-- Step 4 -->
+  <text x="1157" y="142" class="step">4) Mapping auf Mesh-Indices</text>
+  <text x="1157" y="170" class="txt">Patch-Punkte/Faces werden auf</text>
+  <text x="1157" y="194" class="txt">Original-Vertex-IDs zurueckgefuehrt.</text>
+
+  <path d="M1178,390 C1168,335 1215,300 1268,312 C1328,300 1366,342 1348,400 C1340,447 1290,476 1242,462 C1205,466 1170,430 1178,390 Z" class="mesh"/>
+  <ellipse cx="1260" cy="395" rx="57" ry="38" fill="#ffffff" stroke="#4c4c4c" stroke-width="1.6"/>
+  <circle cx="1212" cy="390" r="7" class="pt"/>
+  <circle cx="1228" cy="363" r="7" class="pt"/>
+  <circle cx="1263" cy="353" r="7" class="pt"/>
+  <circle cx="1298" cy="365" r="7" class="pt"/>
+  <circle cx="1312" cy="390" r="7" class="pt"/>
+  <circle cx="1298" cy="420" r="7" class="pt"/>
+  <circle cx="1263" cy="434" r="7" class="pt"/>
+  <circle cx="1228" cy="422" r="7" class="pt"/>
+
+  <text x="1205" y="520" class="idx">v12</text>
+  <text x="1238" y="505" class="idx">v87</text>
+  <text x="1270" y="503" class="idx">v201</text>
+  <text x="1300" y="518" class="idx">v44</text>
+  <text x="1318" y="545" class="idx">v350</text>
+  <text x="1294" y="575" class="idx">v19</text>
+  <text x="1264" y="588" class="idx">v142</text>
+  <text x="1230" y="580" class="idx">v73</text>
+
+  <text x="1157" y="620" class="tiny">Output in opa_checkpoint.pkl:</text>
+  <text x="1157" y="642" class="tiny">op_v_indices, op_rec_v, op_rec_f, op_rec_f_map</text>
+  <text x="1157" y="680" class="tiny">Damit kann der Loss spaeter robust auf Mesh-Struktur arbeiten.</text>
+
+  <!-- Flow arrows -->
+  <line x1="375" y1="445" x2="405" y2="445" class="arrow"/>
+  <line x1="740" y1="445" x2="770" y2="445" class="arrow"/>
+  <line x1="1105" y1="445" x2="1135" y2="445" class="arrow"/>
+
+  <!-- Footer -->
+  <text x="40" y="828" class="txt">Wichtig: Du klickst auf dem 3D-Mesh. Der Querschnitt entsteht erst danach algorithmisch.</text>
+</svg>
