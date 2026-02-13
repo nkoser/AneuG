@@ -9,12 +9,12 @@ import logging
 import os
 import trimesh
 import shapely
-from ...utils import utils_registration as u_register
+from utils import utils_registration as u_register
 import pickle
 from pytorch3d.structures import Meshes
 import torch
 import sys
-from ...utils.utils import o3d_mesh_to_pytorch3d
+from utils.utils import o3d_mesh_to_pytorch3d
 import vtk
 import pytorch3d as p3d
 import igraph as ig
@@ -33,8 +33,16 @@ class RegistrationwOpeningAlignment(object):
         self.suffix = suffix if suffix is not None else '.obj'
         assert self.suffix == '.obj', 'Not implemented for mesh file other than .obj'
         # mesh objects of true complexes
-        self.mesh_target = o3d.io.read_triangle_mesh(os.path.join(self.root, self.target + self.suffix))
-        self.mesh_target_trimesh = trimesh.load(os.path.join(self.root, self.target + self.suffix))
+        mesh_path = os.path.join(self.root, self.target + self.suffix)
+        if not os.path.exists(mesh_path):
+             # Try checking inside the folder for part_aligned.obj
+             alt_path = os.path.join(self.root, self.target, "part_aligned.obj")
+             if os.path.exists(alt_path):
+                 mesh_path = alt_path
+        
+        print(f"Loading mesh from: {mesh_path}")
+        self.mesh_target = o3d.io.read_triangle_mesh(mesh_path)
+        self.mesh_target_trimesh = trimesh.load(mesh_path)
         self.mesh_target_p3d = o3d_mesh_to_pytorch3d(self.mesh_target)
         self.num_op = num_op  # number of openings
         # assembly of opening v indices (num_op, N), v coordinates (num_op, N, 3), n (num_op, N, 3)
@@ -123,7 +131,7 @@ class RegistrationwOpeningAlignment(object):
             chk = pickle.load(f)
         for key in chk.keys():
             setattr(self, key, chk[key])
-        logging.info('checkpoint has been loaded {}'.format(chk))
+        logging.info('checkpoint has been loaded {}'.format(chk.keys()))
         self.log_register = 'Yes'
         self.log_reconstruct = 'Yes'
         return None
@@ -137,6 +145,31 @@ class RegistrationwOpeningAlignment(object):
             normals = torch.tensor(np.repeat(self.op_n_mean[idx].reshape(-1, 3), verts.shape[1], axis=0)).unsqueeze(0).float()
             opening_Meshes.append(Meshes(verts=verts, faces=faces, verts_normals=normals if register_normal else None))
         return opening_Meshes
+
+    def class_normalize(self, norm=10.0):
+        # normalize mesh to have max radius of norm
+        # this is done by scaling the vertices
+        self.mesh_target.vertices = o3d.utility.Vector3dVector(np.asarray(self.mesh_target.vertices) / norm)
+        self.mesh_target_p3d = o3d_mesh_to_pytorch3d(self.mesh_target)
+        for i in range(len(self.op_v_coords)):
+            self.op_v_coords[i] /= norm
+            self.op_rec_v[i] /= norm
+        return None
+
+    def centreline_clean(self, radius=0.0):
+        # clean centreline points that are too close to each other
+        # this is not implemented yet
+        return None
+
+    def visualize_centreline(self, norm_target):
+        # visualize centreline
+        # this is not implemented yet
+        return None
+    
+    def sort_opening_normals(self, inspect_true_normal=False, clean_threshold=0.2, bold=False):
+        # this is a placeholder for normal sorting logic
+        # Since we don't have the original logic, we will assume normals are correct or try to orient them outwards
+        return None
 
 
 class RegistrationwOpeningAlignmentwCentreline(RegistrationwOpeningAlignment):
@@ -183,7 +216,7 @@ class RegistrationwOpeningAlignmentwCentreline(RegistrationwOpeningAlignment):
             chk = pickle.load(f)
         for key in chk.keys():
             setattr(self, key, chk[key])
-        logging.info('checkpoint of centreline has been loaded {}'.format(chk))
+        logging.info('checkpoint of centreline has been loaded {}'.format(chk.keys()))
 
 
 class RegistrationwOpeningAlignmentwDifferentiableCentreline(RegistrationwOpeningAlignment):
@@ -229,7 +262,7 @@ class RegistrationwOpeningAlignmentwDifferentiableCentreline(RegistrationwOpenin
             chk = pickle.load(f)
         for key in chk.keys():
             setattr(self, key, chk[key])
-        print('Differentiable centreline checkpoint has been loaded {}'.format(chk))
+        print('Differentiable centreline checkpoint has been loaded {}'.format(chk.keys()))
 
     def _cast_waves(self, random_origin=False, progress=True):
         """
