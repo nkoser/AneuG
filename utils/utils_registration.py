@@ -203,7 +203,14 @@ def get_mapped_sequence_and_faces(op_v_indices, points_projected, vertices_3d, f
         faces -= 1  # shapely index vertices from 1 instead of 0 *^*
         points_projected = points_projected[:-1, :]
         vertices_3d = vertices_3d[:-1, :]
-    assert points_projected.shape == vertices_3d.shape, 'getting mapping, shape not matched'
+    # Handle duplicated closing point if present on projected contour.
+    if points_projected.shape[0] == len(op_v_indices) + 1 and np.allclose(points_projected[0], points_projected[-1]):
+        points_projected = points_projected[:-1, :]
+    if points_projected.shape[0] != len(op_v_indices):
+        raise ValueError(
+            f"opening mapping expects len(points_projected)==len(op_v_indices), "
+            f"got {points_projected.shape[0]} and {len(op_v_indices)}"
+        )
     order = []
     N = vertices_3d.shape[0]
     for idx in range(N):
@@ -213,4 +220,3 @@ def get_mapped_sequence_and_faces(op_v_indices, points_projected, vertices_3d, f
     mapping = dict(zip(list(np.arange(N)), order))
     op_rec_f_map = np.vectorize(lambda x: mapping.get(x))(faces)
     return np.array(order), op_rec_f_map
-
