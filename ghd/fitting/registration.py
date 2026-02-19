@@ -346,6 +346,116 @@ class RegistrationwOpeningAlignment(object):
             best_perm = greedy
         return best_perm
 
+    def _extract_normal_graph_cluster_candidates(
+        self,
+        normal_dot_min: float = 0.90,
+        min_loop_vertices: int = 12,
+    ) -> List[Dict[str, object]]:
+        mesh = self.mesh_target_trimesh
+        if not isinstance(mesh, trimesh.Trimesh):
+            return []
+        faces = np.asarray(mesh.faces, dtype=np.int64)
+        if faces.size == 0:
+            return []
+        face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
+        if face_normals.shape[0] != faces.shape[0]:
+            return []
+        face_adj = np.asarray(mesh.face_adjacency, dtype=np.int64)
+        if face_adj.size == 0:
+            return []
+
+        cache = self._get_mesh_graph_cache()
+        verts = cache["verts"]
+        median_edge = cache["median_edge_length"]
+        global_centroid = np.mean(verts, axis=0)
+
+        # Keep face-neighbor edges whose normals are similarly oriented.
+        keep_edges = []
+        ndot = np.abs(np.einsum("ij,ij->i", face_normals[face_adj[:, 0]], face_normals[face_adj[:, 1]]))
+        valid = ndot >= float(normal_dot_min)
+        if np.any(valid):
+            keep_edges = face_adj[valid].tolist()
+        if len(keep_edges) == 0:
+            return []
+
+        fgraph = ig.Graph(n=faces.shape[0], edges=keep_edges, directed=False)
+        fcomps = fgraph.components()
+        comp_face_min = max(6, int(min_loop_vertices) // 2)
+        candidates = []
+
+        for comp in fcomps:
+            comp = np.asarray(comp, dtype=np.int64)
+            if comp.size < comp_face_min:
+                continue
+            comp_faces = faces[comp]
+            tri_edges = np.concatenate(
+                (
+                    comp_faces[:, [0, 1]],
+                    comp_faces[:, [1, 2]],
+                    comp_faces[:, [2, 0]],
+                ),
+                axis=0,
+            )
+            tri_edges = np.sort(tri_edges, axis=1)
+            uniq_edges, counts = np.unique(tri_edges, axis=0, return_counts=True)
+            boundary_edges = uniq_edges[counts == 1]
+            if boundary_edges.size == 0:
+                continue
+
+            boundary_vertices = np.unique(boundary_edges.reshape(-1))
+            if boundary_vertices.size < max(6, min_loop_vertices):
+                continue
+            lut = -np.ones(verts.shape[0], dtype=np.int64)
+            lut[boundary_vertices] = np.arange(boundary_vertices.shape[0], dtype=np.int64)
+            local_edges = lut[boundary_edges]
+            bgraph = ig.Graph(n=boundary_vertices.shape[0], edges=local_edges.tolist(), directed=False)
+
+            for bcomp in bgraph.components():
+                bcomp = np.asarray(bcomp, dtype=np.int64)
+                if bcomp.size < max(6, min_loop_vertices):
+                    continue
+                loop_idx = boundary_vertices[bcomp]
+                coords = verts[loop_idx]
+                center = np.mean(coords, axis=0)
+                normal = self._estimate_loop_normal(coords)
+                radial = np.linalg.norm(coords - center.reshape(1, 3), axis=1)
+                coverage = self._loop_angular_coverage(coords, normal, bins=18)
+                if coverage < 0.45:
+                    continue
+
+                planarity_pen = 0.0
+                centered = coords - center.reshape(1, 3)
+                try:
+                    _, svals, _ = np.linalg.svd(centered, full_matrices=False)
+                    if svals.shape[0] >= 3:
+                        planarity_pen = 2.2 * float(svals[-1] / (svals[0] + 1e-6))
+                except np.linalg.LinAlgError:
+                    planarity_pen = 0.0
+                circ_pen = 0.25 * float(np.std(radial) / (np.mean(radial) + 1e-6))
+                cov_pen = max(0.0, 0.65 - coverage) * 4.0
+                size_pen = max(0.0, float(min_loop_vertices - loop_idx.size)) * 0.05
+                # Prefer terminal/outward regions over central sidewall patches.
+                center_idx = int(self._map_points_to_mesh_vertices(center.reshape(1, 3))[0])
+                dist_center = self._distances_from_vertex(center_idx)
+                finite_mask = np.isfinite(dist_center)
+                ecc_bonus = 0.0
+                if np.any(finite_mask):
+                    ecc_bonus = -0.015 * float(np.max(dist_center[finite_mask]) / (median_edge + 1e-12))
+                dist_bonus = -0.04 * float(np.linalg.norm(center - global_centroid) / (median_edge + 1e-12))
+                score = float(size_pen + circ_pen + cov_pen + planarity_pen + ecc_bonus + dist_bonus)
+
+                candidates.append(
+                    {
+                        "loop_idx": np.asarray(loop_idx, dtype=np.int64),
+                        "center": center,
+                        "normal": normal,
+                        "tangent": normal.copy(),
+                        "source": "normal_graph_cluster",
+                        "score": score,
+                    }
+                )
+        return candidates
+
     def _extract_normal_patch_loop(
         self,
         path: np.ndarray,
@@ -1206,6 +1316,22 @@ class RegistrationwOpeningAlignment(object):
             mesh_normals = None
 
         candidates = []
+        anchor_indices = []
+        anchor_center_idx = None
+        try:
+            anchor_indices = self._select_endpoint_indices_fps(int(self.num_op))
+        except Exception:
+            anchor_indices = []
+        if len(anchor_indices) >= int(self.num_op):
+            anchor_indices = [int(i) for i in anchor_indices[: int(self.num_op)]]
+            try:
+                anchor_center_idx = int(self._estimate_bifurcation_index(anchor_indices))
+            except Exception:
+                anchor_center_idx = None
+        self.auto_registration_debug["anchor_endpoint_indices"] = [int(i) for i in anchor_indices]
+        self.auto_registration_debug["anchor_center_index"] = (
+            None if anchor_center_idx is None else int(anchor_center_idx)
+        )
 
         # Stage A: boundary loops (open meshes).
         boundary_loops = self._extract_boundary_loops(min_loop_vertices=max(6, int(min_loop_vertices) // 2))
@@ -1231,42 +1357,25 @@ class RegistrationwOpeningAlignment(object):
                 }
             )
 
-        # Stage B: normal-graph loop extraction from endpoint seeds.
-        seed_count = max(3 * self.num_op, self.num_op + 2)
-        try:
-            tip_seeds = self._select_endpoint_indices_fps(seed_count)
-        except Exception:
-            tip_seeds = []
-        self.auto_registration_debug["seed_count"] = int(len(tip_seeds))
-        for tip_idx in tip_seeds:
-            tangent = verts[int(tip_idx)] - global_centroid
-            t_norm = np.linalg.norm(tangent)
-            if t_norm < 1e-12:
-                continue
-            tangent = tangent / t_norm
-            loop_idx = self._extract_normal_patch_loop_from_tip(
-                tip_idx=int(tip_idx),
-                tangent=tangent,
+        # Stage B: global face-graph normal clustering (your original idea).
+        base_thr = float(max(normal_dot_min, face_dot_min))
+        cluster_thresholds = [
+            base_thr,
+            max(0.82, base_thr - 0.06),
+            max(0.75, base_thr - 0.12),
+        ]
+        cluster_candidates_total = 0
+        for thr in cluster_thresholds:
+            cands_thr = self._extract_normal_graph_cluster_candidates(
+                normal_dot_min=float(thr),
                 min_loop_vertices=int(min_loop_vertices),
-                normal_dot_min=float(normal_dot_min),
-                face_dot_min=float(face_dot_min),
             )
-            if loop_idx is None or loop_idx.size < 6:
-                continue
-            loop_idx = np.unique(np.asarray(loop_idx, dtype=np.int64))
-            center = np.mean(verts[loop_idx], axis=0)
-            normal = self._estimate_loop_normal(verts[loop_idx])
-            if np.dot(normal, tangent) < 0:
-                normal = -1.0 * normal
-            candidates.append(
-                {
-                    "loop_idx": loop_idx,
-                    "center": center,
-                    "normal": normal,
-                    "tangent": tangent,
-                    "source": "normal_patch",
-                }
-            )
+            cluster_candidates_total += len(cands_thr)
+            candidates.extend(cands_thr)
+            if len(cands_thr) >= int(self.num_op):
+                break
+        self.auto_registration_debug["cluster_thresholds"] = [float(t) for t in cluster_thresholds]
+        self.auto_registration_debug["cluster_candidates_raw"] = int(cluster_candidates_total)
 
         # Deduplicate and score candidates.
         deduped = []
@@ -1274,6 +1383,10 @@ class RegistrationwOpeningAlignment(object):
             loop_idx = np.asarray(cand["loop_idx"], dtype=np.int64)
             keep = True
             for j, prev in enumerate(deduped):
+                cand_anchor = cand.get("anchor_id", None)
+                prev_anchor = prev.get("anchor_id", None)
+                if cand_anchor is not None and prev_anchor is not None and int(cand_anchor) != int(prev_anchor):
+                    continue
                 inter = np.intersect1d(loop_idx, prev["loop_idx"]).size
                 denom = max(1, min(loop_idx.size, prev["loop_idx"].size))
                 overlap = inter / float(denom)
@@ -1301,32 +1414,60 @@ class RegistrationwOpeningAlignment(object):
         for cand in deduped:
             coords = verts[cand["loop_idx"]]
             center = cand["center"]
+            center_idx = int(self._map_points_to_mesh_vertices(center.reshape(1, 3))[0])
             radial = np.linalg.norm(coords - center.reshape(1, 3), axis=1)
             coverage = self._loop_angular_coverage(coords, cand["normal"], bins=16)
+            planarity_pen = 0.0
+            if coords.shape[0] >= 6:
+                centered = coords - np.mean(coords, axis=0, keepdims=True)
+                try:
+                    _, svals, _ = np.linalg.svd(centered, full_matrices=False)
+                    if svals.shape[0] >= 3:
+                        planarity_pen = 2.2 * float(svals[-1] / (svals[0] + 1e-6))
+                except np.linalg.LinAlgError:
+                    planarity_pen = 0.0
             size_pen = max(0.0, float(min_loop_vertices - len(cand["loop_idx"]))) * 0.05
             circ_pen = 0.25 * float(np.std(radial) / (np.mean(radial) + 1e-6))
             cov_pen = max(0.0, 0.65 - coverage) * 4.0
             dist_bonus = -0.04 * (
                 np.linalg.norm(center - global_centroid) / (median_edge + 1e-12)
             )
+            # Favor vertices with high geodesic eccentricity to avoid selecting sidewall aneurysm patches.
+            dist_center = self._distances_from_vertex(center_idx)
+            finite_mask = np.isfinite(dist_center)
+            ecc_bonus = 0.0
+            if np.any(finite_mask):
+                ecc_bonus = -0.015 * float(np.max(dist_center[finite_mask]) / (median_edge + 1e-12))
             source_bonus = -0.4 if cand["source"] == "boundary" else 0.0
-            cand["score"] = float(size_pen + circ_pen + cov_pen + dist_bonus + source_bonus)
+            cand["score"] = float(
+                size_pen
+                + circ_pen
+                + cov_pen
+                + planarity_pen
+                + dist_bonus
+                + ecc_bonus
+                + source_bonus
+            )
 
-        # Select num_op diverse loops.
+        # Select num_op loops from clustered candidates using score + diversity.
         selected = []
-        remaining = sorted(deduped, key=lambda x: x["score"])
-        if len(remaining) > 0:
-            selected.append(remaining.pop(0))
-        while len(selected) < self.num_op and len(remaining) > 0:
-            best_idx, best_obj = None, np.inf
-            for idx, cand in enumerate(remaining):
-                sep = min(np.linalg.norm(cand["center"] - s["center"]) for s in selected)
-                sep_gain = 0.06 * (sep / (median_edge + 1e-12))
-                obj = cand["score"] - sep_gain
-                if obj < best_obj:
-                    best_obj = obj
-                    best_idx = idx
-            selected.append(remaining.pop(int(best_idx)))
+        selection_mode = "cluster_diverse"
+
+        if len(selected) == 0:
+            remaining = sorted(deduped, key=lambda x: x["score"])
+            if len(remaining) > 0:
+                selected.append(remaining.pop(0))
+            while len(selected) < self.num_op and len(remaining) > 0:
+                best_idx, best_obj = None, np.inf
+                for idx, cand in enumerate(remaining):
+                    sep = min(np.linalg.norm(cand["center"] - s["center"]) for s in selected)
+                    sep_gain = 0.06 * (sep / (median_edge + 1e-12))
+                    obj = cand["score"] - sep_gain
+                    if obj < best_obj:
+                        best_obj = obj
+                        best_idx = idx
+                selected.append(remaining.pop(int(best_idx)))
+        self.auto_registration_debug["selection_mode"] = selection_mode
 
         if len(selected) < self.num_op:
             # If not enough candidates were found, fallback to legacy method.
@@ -1347,10 +1488,99 @@ class RegistrationwOpeningAlignment(object):
                 "normals_debug_snapshot": dict(self.auto_registration_debug),
             }
             return self.register_openings_auto(min_loop_vertices=min_loop_vertices)
-        centreline_summary = self._centreline_from_endpoint_indices(
-            endpoint_indices=endpoint_indices,
-            sort_branches=True,
-        )
+        endpoint_indices = [int(i) for i in endpoint_indices[: int(self.num_op)]]
+        self.auto_registration_debug["opening_center_endpoint_indices_initial"] = endpoint_indices.copy()
+
+        centreline_summary = None
+        endpoint_repair_used = False
+        endpoint_repair_trials = 0
+        try:
+            centreline_summary = self._centreline_from_endpoint_indices(
+                endpoint_indices=endpoint_indices,
+                sort_branches=True,
+            )
+        except RuntimeError:
+            # Recover when one endpoint candidate collapses to a non-terminal/bifurcation region.
+            candidate_lists = []
+            per_center_limit = max(8, 3 * int(self.num_op))
+            query_k = max(12, 5 * int(self.num_op))
+            for center in opening_centers:
+                try:
+                    d, idx = self.mesh_target_trimesh.kdtree.query(center, k=query_k)
+                    d = np.asarray(d).reshape(-1).astype(np.float64)
+                    idx = np.asarray(idx).reshape(-1).astype(np.int64)
+                except Exception:
+                    sq = np.sum((verts - center.reshape(1, 3)) ** 2, axis=1)
+                    idx = np.argsort(sq).astype(np.int64)
+                    d = np.sqrt(np.maximum(sq[idx], 0.0))
+                order = np.argsort(d)
+                uniq = []
+                seen = set()
+                for j in order:
+                    v = int(idx[int(j)])
+                    if v in seen:
+                        continue
+                    uniq.append(v)
+                    seen.add(v)
+                    if len(uniq) >= per_center_limit:
+                        break
+                candidate_lists.append(uniq)
+            for i, seed in enumerate(endpoint_indices):
+                if i >= len(candidate_lists):
+                    break
+                if seed in candidate_lists[i]:
+                    candidate_lists[i].remove(seed)
+                candidate_lists[i].insert(0, int(seed))
+
+            self.auto_registration_debug["opening_center_candidate_sizes"] = [len(c) for c in candidate_lists]
+            best_summary = None
+            best_endpoint_indices = None
+            best_cost = np.inf
+            max_trials = 9000
+            for combo in itertools.product(*candidate_lists):
+                endpoint_repair_trials += 1
+                if endpoint_repair_trials > max_trials:
+                    break
+                if len(set(combo)) < int(self.num_op):
+                    continue
+                combo_indices = [int(v) for v in combo]
+                try:
+                    summary_try = self._centreline_from_endpoint_indices(
+                        endpoint_indices=combo_indices,
+                        sort_branches=True,
+                    )
+                except RuntimeError:
+                    continue
+                combo_pts = verts[np.asarray(combo_indices, dtype=np.int64)]
+                cost = float(np.sum(np.linalg.norm(combo_pts - opening_centers, axis=1)))
+                if cost < best_cost:
+                    best_cost = cost
+                    best_summary = summary_try
+                    best_endpoint_indices = combo_indices
+                    if cost <= 2.5 * float(self.num_op) * median_edge:
+                        break
+
+            if best_summary is not None:
+                endpoint_repair_used = True
+                endpoint_indices = [int(v) for v in best_endpoint_indices]
+                centreline_summary = best_summary
+            else:
+                # Last resort: recover centreline from mesh endpoints to avoid hard failure.
+                try:
+                    centreline_summary = self.extract_centreline_from_mesh(
+                        num_endpoints=self.num_op,
+                        sort_branches=True,
+                    )
+                    self.auto_registration_debug["centreline_recovery"] = "mesh_fps_fallback"
+                except Exception:
+                    self._auto_reg_pending_debug = {
+                        "fallback_from": "register_openings_auto_normals",
+                        "fallback_reason": "centreline_path_recovery_failed",
+                        "normals_debug_snapshot": dict(self.auto_registration_debug),
+                    }
+                    return self.register_openings_auto(min_loop_vertices=min_loop_vertices)
+        self.auto_registration_debug["opening_center_endpoint_repair_used"] = bool(endpoint_repair_used)
+        self.auto_registration_debug["opening_center_endpoint_repair_trials"] = int(endpoint_repair_trials)
 
         # Match selected openings to sorted centreline endpoints.
         endpoint_pts = np.asarray(centreline_summary["endpoints"], dtype=np.float64)
