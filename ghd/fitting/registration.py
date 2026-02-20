@@ -1357,48 +1357,112 @@ class RegistrationwOpeningAlignment(object):
                 }
             )
 
-        # Stage B: global face-graph normal clustering (your original idea).
+        # Stage B: global face-graph normal clustering (with adaptive retries).
+        def _deduplicate_candidates(cand_list):
+            dedup_list = []
+            for cand in cand_list:
+                loop_idx = np.asarray(cand["loop_idx"], dtype=np.int64)
+                keep = True
+                for j, prev in enumerate(dedup_list):
+                    cand_anchor = cand.get("anchor_id", None)
+                    prev_anchor = prev.get("anchor_id", None)
+                    if cand_anchor is not None and prev_anchor is not None and int(cand_anchor) != int(prev_anchor):
+                        continue
+                    inter = np.intersect1d(loop_idx, prev["loop_idx"]).size
+                    denom = max(1, min(loop_idx.size, prev["loop_idx"].size))
+                    overlap = inter / float(denom)
+                    center_dist = np.linalg.norm(cand["center"] - prev["center"])
+                    if overlap > 0.65 or center_dist < 2.0 * median_edge:
+                        # Keep the larger loop for stability.
+                        if loop_idx.size > prev["loop_idx"].size:
+                            dedup_list[j] = cand
+                        keep = False
+                        break
+                if keep:
+                    dedup_list.append(cand)
+            return dedup_list
+
         base_thr = float(max(normal_dot_min, face_dot_min))
-        cluster_thresholds = [
-            base_thr,
-            max(0.82, base_thr - 0.06),
-            max(0.75, base_thr - 0.12),
-        ]
+        tried_thr = set()
+        cluster_attempts = []
         cluster_candidates_total = 0
-        for thr in cluster_thresholds:
-            cands_thr = self._extract_normal_graph_cluster_candidates(
-                normal_dot_min=float(thr),
-                min_loop_vertices=int(min_loop_vertices),
+
+        def _run_cluster_thresholds(label: str, thresholds: List[float]):
+            nonlocal cluster_candidates_total
+            local_thresholds = []
+            local_added = 0
+            for thr in thresholds:
+                thr = float(np.clip(thr, 0.50, 0.9995))
+                key = round(thr, 6)
+                if key in tried_thr:
+                    continue
+                tried_thr.add(key)
+                local_thresholds.append(thr)
+                cands_thr = self._extract_normal_graph_cluster_candidates(
+                    normal_dot_min=thr,
+                    min_loop_vertices=int(min_loop_vertices),
+                )
+                local_added += len(cands_thr)
+                cluster_candidates_total += len(cands_thr)
+                candidates.extend(cands_thr)
+                if len(cands_thr) >= int(self.num_op):
+                    break
+            if len(local_thresholds) > 0:
+                cluster_attempts.append(
+                    {
+                        "label": str(label),
+                        "thresholds": [float(t) for t in local_thresholds],
+                        "added_candidates": int(local_added),
+                    }
+                )
+            return local_added
+
+        # First pass.
+        _run_cluster_thresholds(
+            "base",
+            [
+                base_thr,
+                max(0.82, base_thr - 0.06),
+                max(0.75, base_thr - 0.12),
+            ],
+        )
+        deduped = _deduplicate_candidates(candidates)
+
+        # Retry pass: lower threshold when too few candidates survived.
+        if len(deduped) < int(self.num_op):
+            _run_cluster_thresholds(
+                "lower_retry",
+                [
+                    max(0.78, base_thr - 0.10),
+                    max(0.70, base_thr - 0.16),
+                    max(0.62, base_thr - 0.22),
+                    max(0.55, base_thr - 0.28),
+                ],
             )
-            cluster_candidates_total += len(cands_thr)
-            candidates.extend(cands_thr)
-            if len(cands_thr) >= int(self.num_op):
-                break
-        self.auto_registration_debug["cluster_thresholds"] = [float(t) for t in cluster_thresholds]
+            deduped = _deduplicate_candidates(candidates)
+
+        # Optional rescue: in some cases everything merges into one giant component;
+        # stricter thresholds can split it into usable terminal patches.
+        if len(deduped) < int(self.num_op):
+            strict_base = float(min(0.995, max(base_thr + 0.08, 0.94)))
+            strict_thresholds = [
+                strict_base,
+                max(0.92, strict_base - 0.03),
+                max(0.90, strict_base - 0.06),
+            ]
+            _run_cluster_thresholds(
+                "strict_retry",
+                strict_thresholds,
+            )
+            deduped = _deduplicate_candidates(candidates)
+
+        self.auto_registration_debug["cluster_thresholds"] = [
+            float(t) for attempt in cluster_attempts for t in attempt["thresholds"]
+        ]
+        self.auto_registration_debug["cluster_threshold_attempts"] = cluster_attempts
+        self.auto_registration_debug["cluster_retry_used"] = bool(len(cluster_attempts) > 1)
         self.auto_registration_debug["cluster_candidates_raw"] = int(cluster_candidates_total)
 
-        # Deduplicate and score candidates.
-        deduped = []
-        for cand in candidates:
-            loop_idx = np.asarray(cand["loop_idx"], dtype=np.int64)
-            keep = True
-            for j, prev in enumerate(deduped):
-                cand_anchor = cand.get("anchor_id", None)
-                prev_anchor = prev.get("anchor_id", None)
-                if cand_anchor is not None and prev_anchor is not None and int(cand_anchor) != int(prev_anchor):
-                    continue
-                inter = np.intersect1d(loop_idx, prev["loop_idx"]).size
-                denom = max(1, min(loop_idx.size, prev["loop_idx"].size))
-                overlap = inter / float(denom)
-                center_dist = np.linalg.norm(cand["center"] - prev["center"])
-                if overlap > 0.65 or center_dist < 2.0 * median_edge:
-                    # Keep the larger loop for stability.
-                    if loop_idx.size > prev["loop_idx"].size:
-                        deduped[j] = cand
-                    keep = False
-                    break
-            if keep:
-                deduped.append(cand)
         self.auto_registration_debug["candidate_count_raw"] = int(len(candidates))
         self.auto_registration_debug["candidate_count_dedup"] = int(len(deduped))
 
