@@ -214,6 +214,120 @@ class RegistrationwOpeningAlignment(object):
             return np.array([0.0, 0.0, 1.0], dtype=np.float64)
         return tangent / tangent_norm
 
+    def _path_turn_curvature(self, path: np.ndarray, tip_window_frac: float = 0.45) -> Dict[str, float]:
+        path = np.asarray(path, dtype=np.int64).reshape(-1)
+        if path.size < 4:
+            return {
+                "turn_mean": 0.0,
+                "turn_p90": 0.0,
+                "tip_turn_mean": 0.0,
+                "tip_turn_p90": 0.0,
+            }
+        cache = self._get_mesh_graph_cache()
+        pts = cache["verts"][path]
+        seg = np.diff(pts, axis=0)
+        seg_norm = np.linalg.norm(seg, axis=1, keepdims=True)
+        valid = seg_norm.reshape(-1) > 1e-12
+        if np.count_nonzero(valid) < 3:
+            return {
+                "turn_mean": 0.0,
+                "turn_p90": 0.0,
+                "tip_turn_mean": 0.0,
+                "tip_turn_p90": 0.0,
+            }
+        unit = np.zeros_like(seg)
+        unit[valid] = seg[valid] / seg_norm[valid]
+        dot = np.sum(unit[:-1] * unit[1:], axis=1)
+        dot = np.clip(dot, -1.0, 1.0)
+        ang = np.arccos(dot)
+        if ang.size == 0:
+            return {
+                "turn_mean": 0.0,
+                "turn_p90": 0.0,
+                "tip_turn_mean": 0.0,
+                "tip_turn_p90": 0.0,
+            }
+        tip_count = max(3, int(np.ceil(float(tip_window_frac) * float(ang.size))))
+        tip_count = min(tip_count, int(ang.size))
+        tip_ang = ang[-tip_count:]
+        return {
+            "turn_mean": float(np.mean(ang)),
+            "turn_p90": float(np.quantile(ang, 0.90)),
+            "tip_turn_mean": float(np.mean(tip_ang)),
+            "tip_turn_p90": float(np.quantile(tip_ang, 0.90)),
+        }
+
+    def _path_elbow_feature(
+        self,
+        path: np.ndarray,
+        distal_frac: float = 0.40,
+    ) -> Dict[str, float]:
+        path = np.asarray(path, dtype=np.int64).reshape(-1)
+        if path.size < 6:
+            return {
+                "elbow_angle": 0.0,
+                "elbow_axis_ratio": 1.0,
+            }
+        cache = self._get_mesh_graph_cache()
+        pts = cache["verts"][path]
+        seg = np.diff(pts, axis=0)
+        seg_norm = np.linalg.norm(seg, axis=1, keepdims=True)
+        valid = seg_norm.reshape(-1) > 1e-12
+        if np.count_nonzero(valid) < 4:
+            return {
+                "elbow_angle": 0.0,
+                "elbow_axis_ratio": 1.0,
+            }
+        unit = np.zeros_like(seg)
+        unit[valid] = seg[valid] / seg_norm[valid]
+        n_seg = unit.shape[0]
+        distal_count = max(3, int(np.ceil(float(distal_frac) * float(n_seg))))
+        distal_count = min(distal_count, n_seg - 1)
+        prox_end = max(1, n_seg - distal_count)
+        prox_start = max(0, prox_end - distal_count)
+        prox_slice = unit[prox_start:prox_end]
+        dist_slice = unit[-distal_count:]
+        if prox_slice.shape[0] < 1 or dist_slice.shape[0] < 1:
+            return {
+                "elbow_angle": 0.0,
+                "elbow_axis_ratio": 1.0,
+            }
+
+        prox_vec = np.mean(prox_slice, axis=0)
+        dist_vec = np.mean(dist_slice, axis=0)
+        prox_norm = np.linalg.norm(prox_vec)
+        dist_norm = np.linalg.norm(dist_vec)
+        if prox_norm < 1e-12 or dist_norm < 1e-12:
+            elbow_angle = 0.0
+        else:
+            prox_vec = prox_vec / prox_norm
+            dist_vec = dist_vec / dist_norm
+            elbow_angle = float(np.arccos(np.clip(np.dot(prox_vec, dist_vec), -1.0, 1.0)))
+
+        window = unit[prox_start:]
+        if window.shape[0] < 3:
+            elbow_axis_ratio = 1.0
+        else:
+            tangent_change = np.diff(window, axis=0)
+            tangent_change = tangent_change[np.linalg.norm(tangent_change, axis=1) > 1e-12]
+            if tangent_change.shape[0] < 3:
+                elbow_axis_ratio = 1.0
+            else:
+                centered = tangent_change - np.mean(tangent_change, axis=0, keepdims=True)
+                try:
+                    _, svals, _ = np.linalg.svd(centered, full_matrices=False)
+                    if svals.shape[0] >= 2:
+                        elbow_axis_ratio = float(svals[1] / (svals[0] + 1e-12))
+                    else:
+                        elbow_axis_ratio = 1.0
+                except np.linalg.LinAlgError:
+                    elbow_axis_ratio = 1.0
+
+        return {
+            "elbow_angle": float(elbow_angle),
+            "elbow_axis_ratio": float(np.clip(elbow_axis_ratio, 0.0, 5.0)),
+        }
+
     def _sort_indices_around_normal(self, indices: np.ndarray, normal: np.ndarray) -> np.ndarray:
         indices = np.asarray(indices, dtype=np.int64).reshape(-1)
         if indices.size <= 2:
@@ -239,6 +353,53 @@ class RegistrationwOpeningAlignment(object):
         angles = np.arctan2(rel @ basis_y, rel @ basis_x)
         order = np.argsort(angles)
         return indices[order]
+
+    def _regularize_loop_indices_angular(
+        self,
+        loop_idx: np.ndarray,
+        normal: np.ndarray,
+        bins_min: int = 24,
+        bins_max: int = 72,
+        radius_quantile: float = 0.60,
+    ) -> np.ndarray:
+        loop_idx = np.unique(np.asarray(loop_idx, dtype=np.int64).reshape(-1))
+        if loop_idx.size < 16:
+            return loop_idx
+        basis = self._angle_basis_from_normal(normal)
+        if basis is None:
+            return loop_idx
+        _, basis_x, basis_y = basis
+        cache = self._get_mesh_graph_cache()
+        coords = cache["verts"][loop_idx]
+        centroid = np.mean(coords, axis=0)
+        rel = coords - centroid.reshape(1, 3)
+        angles = np.arctan2(rel @ basis_y, rel @ basis_x)
+        radial = np.linalg.norm(rel, axis=1)
+
+        n_bins = int(np.clip(loop_idx.size // 2, int(bins_min), int(bins_max)))
+        if n_bins < 12:
+            return loop_idx
+        edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+        picked = []
+        q = float(np.clip(radius_quantile, 0.05, 0.95))
+        for b in range(n_bins):
+            if b == n_bins - 1:
+                mask = (angles >= edges[b]) & (angles <= edges[b + 1])
+            else:
+                mask = (angles >= edges[b]) & (angles < edges[b + 1])
+            local = np.where(mask)[0]
+            if local.size == 0:
+                continue
+            local_r = radial[local]
+            target_r = float(np.quantile(local_r, q))
+            pick_local = int(local[int(np.argmin(np.abs(local_r - target_r)))])
+            picked.append(int(loop_idx[pick_local]))
+        if len(picked) < 12:
+            return loop_idx
+        picked = np.unique(np.asarray(picked, dtype=np.int64))
+        if picked.size < 12:
+            return loop_idx
+        return self._sort_indices_around_normal(picked, normal)
 
     def _map_points_to_mesh_vertices(self, points: np.ndarray) -> np.ndarray:
         points = np.asarray(points, dtype=np.float64)
@@ -1463,6 +1624,254 @@ class RegistrationwOpeningAlignment(object):
         self.auto_registration_debug["cluster_retry_used"] = bool(len(cluster_attempts) > 1)
         self.auto_registration_debug["cluster_candidates_raw"] = int(cluster_candidates_total)
 
+        candidate_count_raw_pre_rescue = int(len(candidates))
+        candidate_count_dedup_pre_rescue = int(len(deduped))
+
+        # Stage C: endpoint-anchored local normal patches.
+        # This rescues cases where global clustering yields too few loops.
+        tip_patch_attempts = []
+        tip_patch_added = 0
+        if len(deduped) < int(self.num_op) and len(anchor_indices) > 0:
+            if anchor_center_idx is not None and 0 <= int(anchor_center_idx) < verts.shape[0]:
+                center_ref = verts[int(anchor_center_idx)]
+                center_ref_idx = int(anchor_center_idx)
+            else:
+                center_ref = global_centroid
+                center_ref_idx = None
+
+            rescue_anchor_pool = [int(i) for i in anchor_indices]
+            rescue_anchor_meta = {}
+            rescue_pool_count = max(8, int(3 * int(self.num_op)))
+            try:
+                pool_indices = self._select_endpoint_indices_fps(rescue_pool_count)
+            except Exception:
+                pool_indices = rescue_anchor_pool.copy()
+            pool_indices = [int(i) for i in pool_indices]
+            pool_indices = list(dict.fromkeys(pool_indices))
+            if center_ref_idx is None and len(pool_indices) >= 2:
+                try:
+                    center_ref_idx = int(self._estimate_bifurcation_index(pool_indices[: max(2, int(self.num_op))]))
+                    center_ref = verts[center_ref_idx]
+                except Exception:
+                    center_ref_idx = None
+            if center_ref_idx is not None:
+                dist_from_center = self._distances_from_vertex(center_ref_idx)
+                ranked = []
+                for idx in pool_indices:
+                    geo = float(dist_from_center[int(idx)]) if np.isfinite(dist_from_center[int(idx)]) else -np.inf
+                    direction = verts[int(idx)] - center_ref
+                    dnorm = float(np.linalg.norm(direction))
+                    if dnorm > 1e-12:
+                        direction = direction / dnorm
+                    else:
+                        direction = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    ranked.append((int(idx), geo, direction))
+                ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
+                diverse = []
+                diverse_dirs = []
+                cos_same_branch = 0.86
+                target_pool = max(int(self.num_op) + 3, 6)
+                for idx, geo, direction in ranked:
+                    is_same = any(float(np.dot(direction, dprev)) > cos_same_branch for dprev in diverse_dirs)
+                    if is_same:
+                        continue
+                    diverse.append((idx, geo, direction))
+                    diverse_dirs.append(direction)
+                    if len(diverse) >= target_pool:
+                        break
+                if len(diverse) < int(self.num_op):
+                    used_idx = {int(v[0]) for v in diverse}
+                    for item in ranked:
+                        if int(item[0]) in used_idx:
+                            continue
+                        diverse.append(item)
+                        if len(diverse) >= target_pool:
+                            break
+                if len(diverse) > 0:
+                    rescue_anchor_pool = [int(v[0]) for v in diverse]
+                    max_geo = max([float(v[1]) for v in diverse if np.isfinite(v[1])] + [1e-6])
+                    for idx, geo, _ in diverse:
+                        geo_val = float(geo) if np.isfinite(geo) else 0.0
+                        rescue_anchor_meta[int(idx)] = {
+                            "geo_distance": geo_val,
+                            "geo_norm": float(np.clip(geo_val / (max_geo + 1e-12), 0.0, 1.0)),
+                        }
+            self.auto_registration_debug["tip_patch_anchor_pool_size"] = int(len(rescue_anchor_pool))
+            self.auto_registration_debug["tip_patch_anchor_pool_indices"] = [int(v) for v in rescue_anchor_pool]
+
+            patch_thresholds = [
+                (
+                    float(np.clip(max(normal_dot_min + 0.10, 0.82), 0.50, 0.995)),
+                    float(np.clip(max(face_dot_min + 0.02, 0.92), 0.55, 0.999)),
+                ),
+                (
+                    float(np.clip(max(normal_dot_min + 0.04, 0.74), 0.50, 0.99)),
+                    float(np.clip(max(face_dot_min - 0.02, 0.86), 0.55, 0.995)),
+                ),
+                (
+                    float(np.clip(max(normal_dot_min - 0.04, 0.66), 0.50, 0.98)),
+                    float(np.clip(max(face_dot_min - 0.08, 0.78), 0.55, 0.99)),
+                ),
+                (
+                    float(np.clip(max(normal_dot_min - 0.10, 0.58), 0.50, 0.95)),
+                    float(np.clip(max(face_dot_min - 0.16, 0.70), 0.55, 0.98)),
+                ),
+            ]
+            patch_thresholds_unique = []
+            seen_thresholds = set()
+            for nd_thr, fd_thr in patch_thresholds:
+                key = (round(float(nd_thr), 6), round(float(fd_thr), 6))
+                if key in seen_thresholds:
+                    continue
+                seen_thresholds.add(key)
+                patch_thresholds_unique.append((float(nd_thr), float(fd_thr)))
+
+            for anchor_id, tip_idx in enumerate(rescue_anchor_pool):
+                tip_idx = int(tip_idx)
+                tangent = verts[tip_idx] - center_ref
+                tan_norm = np.linalg.norm(tangent)
+                if tan_norm < 1e-12:
+                    tangent = verts[tip_idx] - global_centroid
+                    tan_norm = np.linalg.norm(tangent)
+                if tan_norm < 1e-12:
+                    tangent = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    tan_norm = 1.0
+                tangent = tangent / tan_norm
+
+                attempt = {
+                    "anchor_id": int(anchor_id),
+                    "tip_idx": int(tip_idx),
+                    "thresholds_tried": [],
+                    "accepted": False,
+                }
+                for nd_thr, fd_thr in patch_thresholds_unique:
+                    attempt["thresholds_tried"].append(
+                        {
+                            "normal_dot_min": float(nd_thr),
+                            "face_dot_min": float(fd_thr),
+                        }
+                    )
+                    loop_idx = self._extract_normal_patch_loop_from_tip(
+                        tip_idx=tip_idx,
+                        tangent=tangent,
+                        min_loop_vertices=int(min_loop_vertices),
+                        normal_dot_min=float(nd_thr),
+                        face_dot_min=float(fd_thr),
+                    )
+                    if loop_idx is None or loop_idx.size < 6:
+                        continue
+                    loop_idx = np.unique(np.asarray(loop_idx, dtype=np.int64))
+                    if loop_idx.size < 6:
+                        continue
+                    coords = verts[loop_idx]
+                    center = np.mean(coords, axis=0)
+                    normal = self._estimate_loop_normal(coords)
+                    if np.dot(normal, tangent) < 0:
+                        normal = -1.0 * normal
+
+                    radius_growth = None
+                    path_turn_mean = None
+                    path_turn_p90 = None
+                    tip_turn_mean = None
+                    tip_turn_p90 = None
+                    elbow_angle = None
+                    elbow_axis_ratio = None
+                    if center_ref_idx is not None:
+                        try:
+                            path_tip = cache["graph"].get_shortest_paths(
+                                v=int(center_ref_idx),
+                                to=int(tip_idx),
+                                mode="all",
+                                weights="weight",
+                                output="vpath",
+                            )[0]
+                            path_tip = np.asarray(path_tip, dtype=np.int64)
+                            if path_tip.size >= 2:
+                                curvature = self._path_turn_curvature(path_tip, tip_window_frac=0.45)
+                                path_turn_mean = float(curvature["turn_mean"])
+                                path_turn_p90 = float(curvature["turn_p90"])
+                                tip_turn_mean = float(curvature["tip_turn_mean"])
+                                tip_turn_p90 = float(curvature["tip_turn_p90"])
+                                elbow = self._path_elbow_feature(path_tip, distal_frac=0.40)
+                                elbow_angle = float(elbow["elbow_angle"])
+                                elbow_axis_ratio = float(elbow["elbow_axis_ratio"])
+                                dist_tip_rg, geo_min_rg, geo_max_rg, _ = self._opening_geo_limits(path_tip, int(tip_idx))
+                                radii_rg = []
+                                for alpha_rg in (0.30, 0.85):
+                                    desired_rg = float(geo_min_rg + alpha_rg * (geo_max_rg - geo_min_rg))
+                                    loop_rg = self._extract_geodesic_ring_loop(
+                                        tip_idx=int(tip_idx),
+                                        tangent=tangent,
+                                        dist_tip=dist_tip_rg,
+                                        desired_geo=desired_rg,
+                                        geo_min=geo_min_rg,
+                                        geo_max=geo_max_rg,
+                                        min_vertices=max(8, int(min_loop_vertices) // 2),
+                                    )
+                                    if loop_rg is None or loop_rg.size < 6:
+                                        radii_rg.append(None)
+                                        continue
+                                    loop_rg = np.unique(np.asarray(loop_rg, dtype=np.int64))
+                                    coords_rg = verts[loop_rg]
+                                    center_rg = np.mean(coords_rg, axis=0)
+                                    radial_rg = np.linalg.norm(coords_rg - center_rg.reshape(1, 3), axis=1)
+                                    radii_rg.append(float(np.median(radial_rg)))
+                                if (
+                                    radii_rg[0] is not None
+                                    and radii_rg[1] is not None
+                                    and radii_rg[0] > 1e-8
+                                ):
+                                    radius_growth = float(radii_rg[1] / radii_rg[0])
+                        except Exception:
+                            radius_growth = None
+                            path_turn_mean = None
+                            path_turn_p90 = None
+                            tip_turn_mean = None
+                            tip_turn_p90 = None
+                            elbow_angle = None
+                            elbow_axis_ratio = None
+                    candidates.append(
+                        {
+                            "loop_idx": loop_idx,
+                            "center": center,
+                            "normal": normal,
+                            "tangent": tangent.copy(),
+                            "source": "normal_tip_patch",
+                            "anchor_id": int(anchor_id),
+                            "tip_idx": int(tip_idx),
+                            "anchor_geo_distance": float(
+                                rescue_anchor_meta.get(int(tip_idx), {}).get("geo_distance", 0.0)
+                            ),
+                            "anchor_geo_norm": float(
+                                rescue_anchor_meta.get(int(tip_idx), {}).get("geo_norm", 0.0)
+                            ),
+                            "radius_growth": None if radius_growth is None else float(radius_growth),
+                            "path_turn_mean": None if path_turn_mean is None else float(path_turn_mean),
+                            "path_turn_p90": None if path_turn_p90 is None else float(path_turn_p90),
+                            "tip_turn_mean": None if tip_turn_mean is None else float(tip_turn_mean),
+                            "tip_turn_p90": None if tip_turn_p90 is None else float(tip_turn_p90),
+                            "elbow_angle": None if elbow_angle is None else float(elbow_angle),
+                            "elbow_axis_ratio": None if elbow_axis_ratio is None else float(elbow_axis_ratio),
+                        }
+                    )
+                    tip_patch_added += 1
+                    attempt["accepted"] = True
+                    attempt["accepted_size"] = int(loop_idx.size)
+                    attempt["accepted_threshold"] = {
+                        "normal_dot_min": float(nd_thr),
+                        "face_dot_min": float(fd_thr),
+                    }
+                    break
+                tip_patch_attempts.append(attempt)
+
+            if tip_patch_added > 0:
+                deduped = _deduplicate_candidates(candidates)
+
+        self.auto_registration_debug["tip_patch_attempts"] = tip_patch_attempts
+        self.auto_registration_debug["tip_patch_added_candidates"] = int(tip_patch_added)
+        self.auto_registration_debug["tip_patch_rescue_used"] = bool(tip_patch_added > 0)
+        self.auto_registration_debug["candidate_count_raw_pre_rescue"] = int(candidate_count_raw_pre_rescue)
+        self.auto_registration_debug["candidate_count_dedup_pre_rescue"] = int(candidate_count_dedup_pre_rescue)
         self.auto_registration_debug["candidate_count_raw"] = int(len(candidates))
         self.auto_registration_debug["candidate_count_dedup"] = int(len(deduped))
 
@@ -1503,6 +1912,38 @@ class RegistrationwOpeningAlignment(object):
             if np.any(finite_mask):
                 ecc_bonus = -0.015 * float(np.max(dist_center[finite_mask]) / (median_edge + 1e-12))
             source_bonus = -0.4 if cand["source"] == "boundary" else 0.0
+            anchor_bonus = 0.0
+            if cand.get("source") == "normal_tip_patch":
+                anchor_geo_norm = float(cand.get("anchor_geo_norm", 0.0))
+                anchor_bonus = -0.50 * float(np.clip(anchor_geo_norm, 0.0, 1.0))
+            growth_pen = 0.0
+            if cand.get("source") == "normal_tip_patch":
+                rg = cand.get("radius_growth", None)
+                if rg is not None and np.isfinite(float(rg)):
+                    growth_pen = 1.35 * max(0.0, float(rg) - 1.68)
+            curvature_bonus = 0.0
+            if cand.get("source") == "normal_tip_patch":
+                tip_p90 = cand.get("tip_turn_p90", None)
+                tip_mean = cand.get("tip_turn_mean", None)
+                if tip_p90 is not None and np.isfinite(float(tip_p90)):
+                    tip_p90_clip = min(float(tip_p90), 1.15)
+                    curvature_bonus += -0.35 * max(0.0, tip_p90_clip - 0.72)
+                if tip_mean is not None and np.isfinite(float(tip_mean)):
+                    curvature_bonus += -0.15 * max(0.0, float(tip_mean) - 0.36)
+            elbow_bonus = 0.0
+            if cand.get("source") == "normal_tip_patch":
+                elbow_angle = cand.get("elbow_angle", None)
+                elbow_axis_ratio = cand.get("elbow_axis_ratio", None)
+                if (
+                    elbow_angle is not None
+                    and elbow_axis_ratio is not None
+                    and np.isfinite(float(elbow_angle))
+                    and np.isfinite(float(elbow_axis_ratio))
+                ):
+                    # Favor tip regions with a clear elbow-like turn in one dominant plane.
+                    angle_term = np.clip((float(elbow_angle) - 0.95) / 0.80, 0.0, 1.25)
+                    axis_term = np.clip((0.72 - float(elbow_axis_ratio)) / 0.72, 0.0, 1.0)
+                    elbow_bonus = -0.60 * float(angle_term * axis_term)
             cand["score"] = float(
                 size_pen
                 + circ_pen
@@ -1511,14 +1952,86 @@ class RegistrationwOpeningAlignment(object):
                 + dist_bonus
                 + ecc_bonus
                 + source_bonus
+                + anchor_bonus
+                + growth_pen
+                + curvature_bonus
+                + elbow_bonus
             )
 
         # Select num_op loops from clustered candidates using score + diversity.
         selected = []
         selection_mode = "cluster_diverse"
+        selection_candidates = list(deduped)
+        tip_patch_geo_filter_used = False
+        tip_patch_geo_filter_threshold = None
+        tip_patch_total = [c for c in deduped if c.get("source") == "normal_tip_patch"]
+        tip_patch_geo_vals = np.asarray(
+            [float(c.get("anchor_geo_norm", 0.0)) for c in tip_patch_total],
+            dtype=np.float64,
+        )
+        if tip_patch_geo_vals.size >= int(self.num_op + 2):
+            sorted_geo = np.sort(tip_patch_geo_vals)[::-1]
+            nth_geo = float(sorted_geo[int(self.num_op) - 1])
+            # Keep the gate permissive to avoid dropping genuine shorter branches in hard cases.
+            geo_gate = float(max(0.45, nth_geo - 0.30))
+            filtered = []
+            for cand in deduped:
+                if cand.get("source") == "normal_tip_patch" and float(cand.get("anchor_geo_norm", 0.0)) < geo_gate:
+                    continue
+                filtered.append(cand)
+            if len(filtered) >= int(self.num_op):
+                selection_candidates = filtered
+                selection_mode = "cluster_diverse_geo_filtered"
+                tip_patch_geo_filter_used = True
+                tip_patch_geo_filter_threshold = float(geo_gate)
+        self.auto_registration_debug["tip_patch_geo_filter_used"] = bool(tip_patch_geo_filter_used)
+        self.auto_registration_debug["tip_patch_geo_filter_threshold"] = (
+            None if tip_patch_geo_filter_threshold is None else float(tip_patch_geo_filter_threshold)
+        )
+        self.auto_registration_debug["candidate_count_after_geo_filter"] = int(len(selection_candidates))
+
+        debug_ranked_candidates = []
+        for cand in selection_candidates:
+            debug_ranked_candidates.append(
+                {
+                    "source": str(cand.get("source")),
+                    "score": float(cand.get("score", np.inf)),
+                    "size": int(np.asarray(cand.get("loop_idx", []), dtype=np.int64).size),
+                    "tip_idx": None if cand.get("tip_idx", None) is None else int(cand.get("tip_idx")),
+                    "anchor_geo_norm": float(cand.get("anchor_geo_norm", 0.0)),
+                    "radius_growth": (
+                        None
+                        if cand.get("radius_growth", None) is None
+                        else float(cand.get("radius_growth"))
+                    ),
+                    "tip_turn_p90": (
+                        None
+                        if cand.get("tip_turn_p90", None) is None
+                        else float(cand.get("tip_turn_p90"))
+                    ),
+                    "tip_turn_mean": (
+                        None
+                        if cand.get("tip_turn_mean", None) is None
+                        else float(cand.get("tip_turn_mean"))
+                    ),
+                    "elbow_angle": (
+                        None
+                        if cand.get("elbow_angle", None) is None
+                        else float(cand.get("elbow_angle"))
+                    ),
+                    "elbow_axis_ratio": (
+                        None
+                        if cand.get("elbow_axis_ratio", None) is None
+                        else float(cand.get("elbow_axis_ratio"))
+                    ),
+                    "center": np.asarray(cand.get("center", np.zeros(3)), dtype=np.float64).tolist(),
+                }
+            )
+        debug_ranked_candidates = sorted(debug_ranked_candidates, key=lambda x: float(x["score"]))
+        self.auto_registration_debug["candidate_ranking_preview"] = debug_ranked_candidates[: min(12, len(debug_ranked_candidates))]
 
         if len(selected) == 0:
-            remaining = sorted(deduped, key=lambda x: x["score"])
+            remaining = sorted(selection_candidates, key=lambda x: x["score"])
             if len(remaining) > 0:
                 selected.append(remaining.pop(0))
             while len(selected) < self.num_op and len(remaining) > 0:
@@ -1531,6 +2044,169 @@ class RegistrationwOpeningAlignment(object):
                         best_obj = obj
                         best_idx = idx
                 selected.append(remaining.pop(int(best_idx)))
+
+            # Hard-case cleanup: replace likely aneurysm-apex picks with safer outlet candidates.
+            if len(selected) == int(self.num_op):
+                swap_used = False
+                growth_bad_thr = 1.95
+                growth_margin = 0.20
+                score_relax = 0.75
+                low_curv_guard_for_growth = 0.80
+                for si in range(len(selected)):
+                    cand_bad = selected[si]
+                    if cand_bad.get("source") != "normal_tip_patch":
+                        continue
+                    rg_bad = cand_bad.get("radius_growth", None)
+                    if rg_bad is None or not np.isfinite(float(rg_bad)) or float(rg_bad) < growth_bad_thr:
+                        continue
+                    curv_bad = cand_bad.get("tip_turn_p90", None)
+                    if curv_bad is not None and np.isfinite(float(curv_bad)) and float(curv_bad) > low_curv_guard_for_growth:
+                        # Preserve strongly curved transition regions; these are often true outlets.
+                        continue
+                    others = [selected[j] for j in range(len(selected)) if j != si]
+                    best_rep_idx = None
+                    best_rep_obj = np.inf
+                    for ri, rep in enumerate(remaining):
+                        if rep.get("source") != "normal_tip_patch":
+                            continue
+                        rg_rep = rep.get("radius_growth", None)
+                        if rg_rep is None or not np.isfinite(float(rg_rep)):
+                            continue
+                        if float(rg_rep) > float(rg_bad) - growth_margin:
+                            continue
+                        if float(rep["score"]) > float(cand_bad["score"]) + score_relax:
+                            continue
+                        curv_rep = rep.get("tip_turn_p90", None)
+                        if (
+                            curv_bad is not None
+                            and curv_rep is not None
+                            and np.isfinite(float(curv_bad))
+                            and np.isfinite(float(curv_rep))
+                            and float(curv_rep) < float(curv_bad) - 0.12
+                        ):
+                            continue
+                        if len(others) > 0:
+                            sep = min(np.linalg.norm(rep["center"] - s["center"]) for s in others)
+                            sep_gain = 0.06 * (sep / (median_edge + 1e-12))
+                        else:
+                            sep_gain = 0.0
+                        rep_obj = float(rep["score"] - sep_gain)
+                        if rep_obj < best_rep_obj:
+                            best_rep_obj = rep_obj
+                            best_rep_idx = int(ri)
+                    if best_rep_idx is not None:
+                        selected[si] = remaining.pop(best_rep_idx)
+                        swap_used = True
+                if swap_used:
+                    selection_mode = f"{selection_mode}+swap_growth"
+
+                # Additional fallback: promote outlet-like candidates with strong tip curvature
+                # when all selected candidates are low-curvature in hard cases.
+                curvature_swap_used = False
+                high_curv_thr = 0.82
+                low_curv_thr = 0.68
+                growth_guard = 1.90
+                curv_score_relax = 0.85
+                candidate_pairs = []
+                for si, cand_sel in enumerate(selected):
+                    if cand_sel.get("source") != "normal_tip_patch":
+                        continue
+                    curv_sel = cand_sel.get("tip_turn_p90", None)
+                    if curv_sel is None or not np.isfinite(float(curv_sel)) or float(curv_sel) > low_curv_thr:
+                        continue
+                    for ri, rep in enumerate(remaining):
+                        if rep.get("source") != "normal_tip_patch":
+                            continue
+                        curv_rep = rep.get("tip_turn_p90", None)
+                        if curv_rep is None or not np.isfinite(float(curv_rep)) or float(curv_rep) < high_curv_thr:
+                            continue
+                        rg_rep = rep.get("radius_growth", None)
+                        if rg_rep is not None and np.isfinite(float(rg_rep)) and float(rg_rep) > growth_guard:
+                            continue
+                        if float(rep["score"]) > float(cand_sel["score"]) + curv_score_relax:
+                            continue
+                        curv_gain = float(curv_rep) - float(curv_sel)
+                        if curv_gain <= 0.08:
+                            continue
+                        # Favor curvature gain but avoid sacrificing score too much.
+                        gain_obj = curv_gain - 0.30 * max(0.0, float(rep["score"]) - float(cand_sel["score"]))
+                        candidate_pairs.append((gain_obj, si, ri))
+                if len(candidate_pairs) > 0:
+                    candidate_pairs = sorted(candidate_pairs, key=lambda x: float(x[0]), reverse=True)
+                    _, best_si, best_ri = candidate_pairs[0]
+                    selected[int(best_si)] = remaining.pop(int(best_ri))
+                    curvature_swap_used = True
+                if curvature_swap_used:
+                    selection_mode = f"{selection_mode}+swap_curvature_high"
+
+                # Additional fallback: replace weak low-curvature tiny picks with
+                # candidates that have clearly stronger anchor-geodesic support
+                # and stronger distal curvature signature.
+                anchor_curv_swap_used = False
+                bad_anchor_thr = 0.74
+                bad_curv_thr = 0.78
+                bad_size_thr = max(int(min_loop_vertices) + 6, 30)
+                anchor_gain_min = 0.14
+                curv_gain_min = 0.12
+                size_gain_min = 6
+                anchor_curv_score_relax = 0.90
+                for si, cand_bad in enumerate(selected):
+                    if cand_bad.get("source") != "normal_tip_patch":
+                        continue
+                    anchor_bad = float(cand_bad.get("anchor_geo_norm", 0.0))
+                    curv_bad = cand_bad.get("tip_turn_p90", None)
+                    curv_bad_val = None
+                    if curv_bad is not None and np.isfinite(float(curv_bad)):
+                        curv_bad_val = float(curv_bad)
+                    size_bad = int(np.asarray(cand_bad.get("loop_idx", []), dtype=np.int64).size)
+
+                    suspicious = False
+                    if anchor_bad < bad_anchor_thr and size_bad <= bad_size_thr:
+                        suspicious = True
+                    if (
+                        curv_bad_val is not None
+                        and anchor_bad < bad_anchor_thr
+                        and curv_bad_val < bad_curv_thr
+                    ):
+                        suspicious = True
+                    if not suspicious:
+                        continue
+
+                    best_rep_idx = None
+                    best_rep_obj = np.inf
+                    for ri, rep in enumerate(remaining):
+                        if rep.get("source") != "normal_tip_patch":
+                            continue
+                        anchor_rep = float(rep.get("anchor_geo_norm", 0.0))
+                        if anchor_rep < anchor_bad + anchor_gain_min:
+                            continue
+                        curv_rep = rep.get("tip_turn_p90", None)
+                        if curv_rep is None or not np.isfinite(float(curv_rep)):
+                            continue
+                        curv_rep_val = float(curv_rep)
+                        if curv_bad_val is None:
+                            if curv_rep_val < bad_curv_thr:
+                                continue
+                        elif curv_rep_val < curv_bad_val + curv_gain_min:
+                            continue
+                        size_rep = int(np.asarray(rep.get("loop_idx", []), dtype=np.int64).size)
+                        if size_rep < size_bad + size_gain_min:
+                            continue
+                        if float(rep["score"]) > float(cand_bad["score"]) + anchor_curv_score_relax:
+                            continue
+                        rep_obj = float(rep["score"]) - 0.18 * (anchor_rep - anchor_bad) - 0.22 * max(
+                            0.0,
+                            curv_rep_val - (curv_bad_val if curv_bad_val is not None else bad_curv_thr),
+                        )
+                        if rep_obj < best_rep_obj:
+                            best_rep_obj = rep_obj
+                            best_rep_idx = int(ri)
+
+                    if best_rep_idx is not None:
+                        selected[si] = remaining.pop(best_rep_idx)
+                        anchor_curv_swap_used = True
+                if anchor_curv_swap_used:
+                    selection_mode = f"{selection_mode}+swap_anchor_curv"
         self.auto_registration_debug["selection_mode"] = selection_mode
 
         if len(selected) < self.num_op:
@@ -1658,6 +2334,33 @@ class RegistrationwOpeningAlignment(object):
 
         paths = centreline_summary["paths"]
         tangents = centreline_summary["tangents"]
+        synthetic_cut_refinement_used = []
+        final_loop_sources = []
+        loop_shape_score_before = []
+        loop_shape_score_after = []
+
+        def _loop_shape_objective(loop_idx: np.ndarray, normal: np.ndarray) -> float:
+            loop_idx = np.unique(np.asarray(loop_idx, dtype=np.int64).reshape(-1))
+            if loop_idx.size < 6:
+                return np.inf
+            coords = verts[loop_idx]
+            centroid = np.mean(coords, axis=0)
+            radial = np.linalg.norm(coords - centroid.reshape(1, 3), axis=1)
+            radial_cv = float(np.std(radial) / (np.mean(radial) + 1e-6))
+            coverage = self._loop_angular_coverage(coords, normal, bins=24)
+            planarity = 0.0
+            if coords.shape[0] >= 6:
+                centered = coords - centroid.reshape(1, 3)
+                try:
+                    _, svals, _ = np.linalg.svd(centered, full_matrices=False)
+                    if svals.shape[0] >= 3:
+                        planarity = float(svals[-1] / (svals[0] + 1e-6))
+                except np.linalg.LinAlgError:
+                    planarity = 0.0
+            size_pen = max(0.0, 18.0 - float(loop_idx.size)) * 0.020
+            cov_pen = max(0.0, 0.82 - float(coverage)) * 3.5
+            return float(2.2 * radial_cv + 1.5 * planarity + cov_pen + size_pen)
+
         for i in range(self.num_op):
             cand = selected[int(assign[i])]
             loop_idx = np.unique(np.asarray(cand["loop_idx"], dtype=np.int64))
@@ -1671,9 +2374,106 @@ class RegistrationwOpeningAlignment(object):
             if np.dot(n_mean, tangent) < 0:
                 n_mean = -1.0 * n_mean
 
+            # Optional synthetic-cut refinement: replace irregular loops only when shape quality improves.
+            tip_idx = int(paths[i][-1])
+            dist_tip, geo_min, geo_max, _ = self._opening_geo_limits(paths[i], tip_idx)
+            geo_vals = dist_tip[loop_idx]
+            finite_geo = geo_vals[np.isfinite(geo_vals)]
+            desired_geo = (
+                float(np.median(finite_geo))
+                if finite_geo.size > 0
+                else float(0.5 * (geo_min + geo_max))
+            )
+            desired_geo = float(np.clip(desired_geo, geo_min + 0.25 * (geo_max - geo_min), geo_max))
+
+            base_loop_idx = loop_idx.copy()
+            base_score = _loop_shape_objective(base_loop_idx, n_mean)
+            best_loop_idx = base_loop_idx
+            best_score = float(base_score)
+            best_refine_tag = "none"
+
+            refine_candidates = []
+            section_loop = self._extract_section_loop(
+                plane_origin=np.asarray(cand["center"], dtype=np.float64),
+                plane_normal=tangent,
+                tip_idx=tip_idx,
+                geo_min=geo_min,
+                geo_max=geo_max,
+            )
+            if section_loop is not None and section_loop.size >= 6:
+                refine_candidates.append(("section", np.asarray(section_loop, dtype=np.int64)))
+            sign_loop = self._extract_sign_loop(
+                plane_origin=np.asarray(cand["center"], dtype=np.float64),
+                plane_normal=tangent,
+                tip_idx=tip_idx,
+                min_vertices=max(8, int(min_loop_vertices) // 2),
+                geo_min=geo_min,
+                geo_max=geo_max,
+            )
+            if sign_loop is not None and sign_loop.size >= 6:
+                refine_candidates.append(("sign", np.asarray(sign_loop, dtype=np.int64)))
+            geo_loop = self._extract_geodesic_ring_loop(
+                tip_idx=tip_idx,
+                tangent=tangent,
+                dist_tip=dist_tip,
+                desired_geo=desired_geo,
+                geo_min=geo_min,
+                geo_max=geo_max,
+                min_vertices=max(8, int(min_loop_vertices) // 2),
+            )
+            if geo_loop is not None and geo_loop.size >= 6:
+                refine_candidates.append(("geodesic_ring", np.asarray(geo_loop, dtype=np.int64)))
+            patch_loop = self._extract_normal_patch_loop(
+                path=paths[i],
+                tangent=tangent,
+                min_loop_vertices=max(8, int(min_loop_vertices) // 2),
+                normal_dot_min=float(max(0.62, normal_dot_min - 0.06)),
+                face_dot_min=float(max(0.82, face_dot_min - 0.06)),
+            )
+            if patch_loop is not None and patch_loop.size >= 6:
+                refine_candidates.append(("normal_patch", np.asarray(patch_loop, dtype=np.int64)))
+
+            for tag, cand_loop in refine_candidates:
+                cand_loop = np.unique(np.asarray(cand_loop, dtype=np.int64))
+                cand_score = _loop_shape_objective(cand_loop, n_mean)
+                if not np.isfinite(cand_score):
+                    continue
+                # Be more willing to refine tip-patch loops, conservative otherwise.
+                min_improve = 0.03 if str(cand.get("source")) == "normal_tip_patch" else 0.10
+                if cand_score + min_improve < best_score:
+                    best_score = float(cand_score)
+                    best_loop_idx = cand_loop
+                    best_refine_tag = str(tag)
+
+            loop_idx = best_loop_idx
+            refined_used = bool(best_refine_tag != "none")
+            final_source = str(cand.get("source", "unknown"))
+            if refined_used:
+                final_source = f"{final_source}+{best_refine_tag}"
+
+            # Angle-regularized subsampling suppresses jagged star-like polygons on noisy loops.
+            regularized_used = False
+            if loop_idx.size >= max(16, int(min_loop_vertices)):
+                reg_loop_idx = self._regularize_loop_indices_angular(
+                    loop_idx=loop_idx,
+                    normal=n_mean,
+                    bins_min=max(20, int(min_loop_vertices)),
+                    bins_max=max(64, 3 * int(min_loop_vertices)),
+                    radius_quantile=0.60,
+                )
+                reg_score = _loop_shape_objective(reg_loop_idx, n_mean)
+                if np.isfinite(reg_score):
+                    # Keep regularization only when it is meaningfully smoother.
+                    reg_improve_needed = 0.03 if str(cand.get("source")) == "normal_tip_patch" else 0.06
+                    if reg_score + reg_improve_needed < best_score:
+                        loop_idx = np.asarray(reg_loop_idx, dtype=np.int64)
+                        best_score = float(reg_score)
+                        regularized_used = True
+                        final_source = f"{final_source}+angular_regularized"
+
             loop_idx = self._sort_indices_around_normal(loop_idx, n_mean)
             loop_coords = verts[loop_idx]
-            tip = verts[int(paths[i][-1])]
+            tip = verts[tip_idx]
             if np.dot(n_mean, tip - np.mean(loop_coords, axis=0)) < 0:
                 n_mean = -1.0 * n_mean
 
@@ -1686,6 +2486,10 @@ class RegistrationwOpeningAlignment(object):
             self.op_n_mean.append(n_mean)
             self.op_tangent.append(np.asarray(tangent, dtype=np.float64))
             self.op_cut_points.append(np.asarray(cand["center"], dtype=np.float64))
+            synthetic_cut_refinement_used.append(bool(refined_used or regularized_used))
+            final_loop_sources.append(str(final_source))
+            loop_shape_score_before.append(float(base_score))
+            loop_shape_score_after.append(float(best_score))
 
         if len(self.op_v_indices) != self.num_op:
             raise RuntimeError(
@@ -1695,6 +2499,32 @@ class RegistrationwOpeningAlignment(object):
             {
                 "selected_count": int(len(selected)),
                 "selected_sources": [str(c["source"]) for c in selected],
+                "selected_tip_indices": [
+                    None if c.get("tip_idx", None) is None else int(c.get("tip_idx"))
+                    for c in selected
+                ],
+                "selected_tip_turn_p90": [
+                    None
+                    if c.get("tip_turn_p90", None) is None
+                    else float(c.get("tip_turn_p90"))
+                    for c in selected
+                ],
+                "selected_elbow_angle": [
+                    None
+                    if c.get("elbow_angle", None) is None
+                    else float(c.get("elbow_angle"))
+                    for c in selected
+                ],
+                "selected_elbow_axis_ratio": [
+                    None
+                    if c.get("elbow_axis_ratio", None) is None
+                    else float(c.get("elbow_axis_ratio"))
+                    for c in selected
+                ],
+                "final_loop_sources": [str(s) for s in final_loop_sources],
+                "synthetic_cut_refinement_used": [bool(v) for v in synthetic_cut_refinement_used],
+                "loop_shape_score_before": [float(v) for v in loop_shape_score_before],
+                "loop_shape_score_after": [float(v) for v in loop_shape_score_after],
                 "opening_sizes": [len(v) for v in self.op_v_indices],
                 "endpoint_indices": [int(i) for i in centreline_summary.get("endpoint_indices", [])],
             }
@@ -1784,14 +2614,22 @@ class RegistrationwOpeningAlignment(object):
                'op_rec_v': self.op_rec_v, 'op_rec_f': self.op_rec_f,
                'op_rec_v_indices_map': self.op_rec_v_indices_map, 'op_rec_f_map': self.op_rec_f_map,
                'op_tangent': getattr(self, "op_tangent", []),
-               'op_cut_points': getattr(self, "op_cut_points", [])}
+               'op_cut_points': getattr(self, "op_cut_points", []),
+               'auto_registration_debug': getattr(self, "auto_registration_debug", {})}
         # use self.op_rec_f to offset opening meshes, use self.op_rec_f_map if creating opening meshes from mother mesh
         if not chk_path.endswith('.pkl'):
             chk_path += '.pkl'
         with open(chk_path, 'wb') as f:
             pickle.dump(chk, f)
 
-    def load_checkpoint_opa(self, chk_path: str, redo=False, auto=True):
+    def load_checkpoint_opa(
+        self,
+        chk_path: str,
+        redo=False,
+        auto=True,
+        auto_method: str = "legacy",
+        auto_kwargs: Dict[str, object] = None,
+    ):
         # automatic loading
         chk_path = os.path.join(self.root, self.target, 'opa_checkpoint') if chk_path is None else \
             chk_path
@@ -1802,11 +2640,27 @@ class RegistrationwOpeningAlignment(object):
             logging.warning('checkpoint does not exist, redo registration.')
             self._reset_opening_state()
             if auto:
-                self.register_openings_auto()
+                method = str(auto_method).strip().lower()
+                kwargs = dict(auto_kwargs or {})
+                if method in ("legacy", "auto", "default"):
+                    self.register_openings_auto(
+                        min_loop_vertices=int(kwargs.get("min_loop_vertices", 24))
+                    )
+                elif method in ("normals", "auto_normals", "normal"):
+                    self.register_openings_auto_normals(
+                        min_loop_vertices=int(kwargs.get("min_loop_vertices", 24)),
+                        normal_dot_min=float(kwargs.get("normal_dot_min", 0.72)),
+                        face_dot_min=float(kwargs.get("face_dot_min", 0.90)),
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown auto_method='{auto_method}'. "
+                        "Use one of: legacy, normals."
+                    )
             else:
                 self.register_openings()
             self.create_opening_meshes()
-            self.save_checkpoint_opa(None)
+            self.save_checkpoint_opa(chk_path)
         with open(chk_path, 'rb') as f:
             chk = pickle.load(f)
         for key in chk.keys():
@@ -1999,7 +2853,7 @@ class RegistrationwOpeningAlignmentwDifferentiableCentreline(RegistrationwOpenin
             else:
                 self.register_centreline_end_points(auto=False)
             self._cast_waves()
-            self.save_checkpoint_centreline(None)
+            self.save_checkpoint_centreline(chk_path)
         with open(chk_path, 'rb') as f:
             chk = pickle.load(f)
         for key in chk.keys():

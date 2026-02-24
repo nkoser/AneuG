@@ -12,7 +12,7 @@ name_target: AN213_full_clean
 viz_freq: 200
 chk_freq: null
 log_freq: 100
-lr: 0.00075
+lr: 0.0005
 lr_scheduler: plateau
 step_size: 2500
 gamma: 0.75
@@ -35,7 +35,7 @@ sample_num: 250000
 op_sample_num: 1000
 op_clean_threshold: 0.2
 op_bold: 0
-save_root: ./checkpoints/ghd_fitting_output_15000
+save_root: ./checkpoints/ghd_auto_fitting_output_15000
 meta: cut_446_decreasing_centrelineloss_10
 num_sp: 2
 do_dpi: 4

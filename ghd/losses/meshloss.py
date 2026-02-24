@@ -35,6 +35,53 @@ class Mesh_loss(nn.Module):
         self.mse_loss = torch.nn.MSELoss()
         self.dice_loss_attention = BinaryDiceLoss_Weighted(weights_normalize=False)  # conservative: not using weights_normalization
 
+    def _vertex_fallback_sample(self, meshes: Meshes, num_samples: int, return_normals: bool = True):
+        verts = meshes.verts_padded()
+        B = verts.shape[0]
+        dtype = verts.dtype
+        device = verts.device
+        normals_all = None
+        if return_normals:
+            try:
+                normals_all = meshes.verts_normals_padded()
+            except Exception:
+                normals_all = None
+
+        samples_b = []
+        normals_b = []
+        for b in range(B):
+            verts_b = verts[b]
+            finite_mask = torch.isfinite(verts_b).all(dim=-1)
+            if torch.any(finite_mask):
+                verts_valid = verts_b[finite_mask]
+                n_valid = int(verts_valid.shape[0])
+                idx = torch.randint(0, n_valid, (int(num_samples),), device=device)
+                sampled = verts_valid.index_select(0, idx)
+                samples_b.append(sampled)
+                if return_normals:
+                    if normals_all is not None:
+                        normals_valid = normals_all[b][finite_mask]
+                        sampled_normals = normals_valid.index_select(0, idx)
+                        sampled_normals = torch.where(
+                            torch.isfinite(sampled_normals),
+                            sampled_normals,
+                            torch.zeros_like(sampled_normals),
+                        )
+                    else:
+                        sampled_normals = torch.zeros_like(sampled)
+                    normals_b.append(sampled_normals)
+            else:
+                sampled = torch.zeros((int(num_samples), 3), dtype=dtype, device=device)
+                samples_b.append(sampled)
+                if return_normals:
+                    normals_b.append(torch.zeros_like(sampled))
+
+        samples = torch.stack(samples_b, dim=0)
+        if return_normals:
+            normals = torch.stack(normals_b, dim=0)
+            return samples, normals
+        return samples
+
     def _safe_sample_points_from_meshes(self, meshes: Meshes, num_samples: int, return_normals: bool = True):
         """
         sample_points_from_meshes can fail when a mesh becomes degenerate
@@ -42,21 +89,18 @@ class Mesh_loss(nn.Module):
         can continue instead of crashing.
         """
         try:
-            return sample_points_from_meshes(meshes, num_samples, return_normals=return_normals)
+            sampled = sample_points_from_meshes(meshes, num_samples, return_normals=return_normals)
+            if return_normals:
+                points, normals = sampled
+                if (not torch.isfinite(points).all()) or (not torch.isfinite(normals).all()):
+                    raise ValueError("sampled points or normals are non-finite")
+                return points, normals
+            if not torch.isfinite(sampled).all():
+                raise ValueError("sampled points are non-finite")
+            return sampled
         except Exception as e:
             print(f"[Mesh_loss] sample_points_from_meshes failed, using vertex fallback: {e}")
-            verts = meshes.verts_padded()
-            B, N, _ = verts.shape
-            idx = torch.randint(0, N, (B, num_samples), device=verts.device)
-            samples = torch.gather(verts, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-            if return_normals:
-                try:
-                    vnormals = meshes.verts_normals_padded()
-                    normals = torch.gather(vnormals, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
-                except Exception:
-                    normals = torch.zeros_like(samples)
-                return samples, normals
-            return samples
+            return self._vertex_fallback_sample(meshes, num_samples, return_normals=return_normals)
     
     def forward(self, meshes_scr: Meshes, trg: Union[Meshes, torch.Tensor], loss_list:dict, B=1):
         # calcualte all types of losses for self and meshes_scr

@@ -30,12 +30,15 @@ class Mesh_loss_opening_alignment(Mesh_loss):
         loss_n_list = []
         if ('loss_openings_p' in loss_weighting) or ('loss_openings_n' in loss_weighting):
             for idx in range(len(self.target_openings)):
-                pcd_wo, nor_wo = sample_points_from_meshes(warped_openings[idx], self.op_sample_num, return_normals=True)
-                sample_points_from_meshes(warped_openings[idx], self.op_sample_num, return_normals=False)
-                pcd_to, nor_to = sample_points_from_meshes(self.target_openings[idx].to(self.device), self.op_sample_num, return_normals=True)
+                pcd_wo, nor_wo = self._safe_sample_points_from_meshes(
+                    warped_openings[idx], self.op_sample_num, return_normals=True
+                )
+                pcd_to, nor_to = self._safe_sample_points_from_meshes(
+                    self.target_openings[idx].to(self.device), self.op_sample_num, return_normals=True
+                )
                 loss_p, loss_n = chamfer_distance(pcd_wo, pcd_to, x_normals=nor_wo, y_normals=nor_to)
-                loss_p_list.append(loss_p)
-                loss_n_list.append(loss_n)
+                loss_p_list.append(loss_p if torch.isfinite(loss_p) else torch.Tensor([0.0]).to(self.device))
+                loss_n_list.append(loss_n if torch.isfinite(loss_n) else torch.Tensor([0.0]).to(self.device))
             if 'loss_openings_p' in loss_weighting:
                 loss_dict['loss_openings_p'] = loss_p_list
             if 'loss_openings_n' in loss_weighting:

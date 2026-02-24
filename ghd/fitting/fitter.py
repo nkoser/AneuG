@@ -6,6 +6,7 @@ import os
 import sys
 import pickle
 import re
+import numpy as np
 from ghd.base.mesh_geometry import MeshThickness
 import torch.nn.functional as F
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
@@ -229,6 +230,13 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
                 log_dict_raw[term] = raw_item
                 log_dict[term] = weighted_item
         total_loss_item = total_loss.detach().cpu().item()
+        if not np.isfinite(total_loss_item):
+            print(
+                f"[Fitting] Non-finite total_loss at epoch {epoch}. "
+                "Skipping optimizer step for this epoch."
+            )
+            optimizer.zero_grad(set_to_none=True)
+            continue
         writer.add_scalar('TrainWeighted/total_loss', total_loss_item, epoch)
         current_lr = float(optimizer.param_groups[0]["lr"])
         writer.add_scalar('Train/lr', current_lr, epoch)
@@ -344,10 +352,28 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
 
 def initailize_registration(args, hard_normalize=True, keep_size=True):
     print("Bold opening normal sorting = {}".format(True if args.op_bold == 1 else False))
+    def _checkpoint_path(case_root, case_name, ckpt_name):
+        ckpt_name = str(ckpt_name)
+        return os.path.join(case_root, case_name, ckpt_name)
+
+    auto_opening_method = str(getattr(args, "auto_opening_method", "normals"))
+    auto_kwargs = {
+        "min_loop_vertices": int(getattr(args, "auto_min_loop_vertices", 24)),
+        "normal_dot_min": float(getattr(args, "auto_normal_dot_min", 0.72)),
+        "face_dot_min": float(getattr(args, "auto_face_dot_min", 0.90)),
+    }
+    opa_ckpt_name = getattr(args, "opa_checkpoint_name", "opa_checkpoint")
+    cl_ckpt_name = getattr(args, "centreline_checkpoint_name", "diff_centreline_checkpoint")
+
+    canonical_opa_chk = _checkpoint_path(args.root_template, args.name_canonical, opa_ckpt_name)
+    canonical_cl_chk = _checkpoint_path(args.root_template, args.name_canonical, cl_ckpt_name)
+    target_opa_chk = _checkpoint_path(args.root_target, args.name_target, opa_ckpt_name)
+    target_cl_chk = _checkpoint_path(args.root_target, args.name_target, cl_ckpt_name)
+
     canonical = RegistrationwOpeningAlignmentwDifferentiableCentreline(args, args.root_template, args.name_canonical)
-    canonical.load_checkpoint_opa(None)
+    canonical.load_checkpoint_opa(canonical_opa_chk, auto_method=auto_opening_method, auto_kwargs=auto_kwargs)
     canonical.sort_opening_normals(inspect_true_normal=False, clean_threshold=0.2, bold=True if args.op_bold == 1 else False)
-    canonical.load_checkpoint_centreline(None, redo=False)
+    canonical.load_checkpoint_centreline(canonical_cl_chk, redo=False)
     norm_canonical = torch.max(torch.norm(getattr(canonical, "mesh_target_p3d").verts_packed(), dim=-1)).detach().item() * 1.10 if hard_normalize else 10.0
     if keep_size:
         norm_canonical = 2.50 * norm_canonical
@@ -356,9 +382,9 @@ def initailize_registration(args, hard_normalize=True, keep_size=True):
     canonical.centreline_clean(radius=0.5 / norm_canonical)
 
     target = RegistrationwOpeningAlignmentwDifferentiableCentreline(args, args.root_target, args.name_target)
-    target.load_checkpoint_opa(None)
+    target.load_checkpoint_opa(target_opa_chk, auto_method=auto_opening_method, auto_kwargs=auto_kwargs)
     target.sort_opening_normals(inspect_true_normal=False, clean_threshold=0.2, bold=True if args.op_bold == 1 else False)
-    target.load_checkpoint_centreline(None, redo=False)
+    target.load_checkpoint_centreline(target_cl_chk, redo=False)
     norm_target = torch.max(torch.norm(getattr(target, "mesh_target_p3d").verts_packed(),
                                        dim=-1)).detach().item() * 1.10 if hard_normalize else 7.5
     norm_target = norm_canonical if keep_size else norm_target
