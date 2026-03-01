@@ -124,7 +124,7 @@ class Graph_Harmonic_Deform_opening_alignment_dynamic(Graph_Harmonic_Deform):
         # create opening Meshes
         for idx in range(self.num_op):
             self.open_Meshes.append(Meshes(verts=[base_shape.verts_packed()[self.op_rec_v_indices_map[idx], :]],
-                                           faces=[torch.Tensor(self.op_rec_f[idx]).to(self.device)]))  # use non-mapped face indices
+                                           faces=[torch.tensor(self.op_rec_f[idx], dtype=torch.int64, device=self.device)]))  # use non-mapped face indices
         super(Graph_Harmonic_Deform_opening_alignment_dynamic, self).__init__(base_shape=base_shape,
                                                                               num_Basis=args.num_Basis,
                                                                               mix_lap_weight=args.mix_lap_weights)
@@ -138,5 +138,13 @@ class Graph_Harmonic_Deform_opening_alignment_dynamic(Graph_Harmonic_Deform):
         for idx in range(self.num_op):
             output_openings.append(self.open_Meshes[idx].offset_verts(deformation[self.op_rec_v_indices_map[idx], :]))
         R_matrix = axis_angle_to_matrix(self.R)
-        output_shape = output_shape.update_padded((output_shape.verts_padded() @ R_matrix.transpose(-1,-2)*self.s.abs() + self.T).float())
+        scale = self.s.abs()
+        output_shape = output_shape.update_padded(
+            (output_shape.verts_padded() @ R_matrix.transpose(-1, -2) * scale + self.T).float()
+        )
+        # Keep openings in the same transformed frame as the warped full mesh.
+        for idx in range(self.num_op):
+            output_openings[idx] = output_openings[idx].update_padded(
+                (output_openings[idx].verts_padded() @ R_matrix.transpose(-1, -2) * scale + self.T).float()
+            )
         return output_shape, output_openings

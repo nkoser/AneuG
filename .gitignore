@@ -2,4 +2,9 @@ checkpoints/
 datasets/
 .idea/* 
 /.idea*
+*/__pycache__/*
+__pycache__/
+
+settings.json
+AneuG-Own
 

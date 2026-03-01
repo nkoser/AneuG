@@ -157,6 +157,7 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
     early_stopping_patience = int(getattr(args, "early_stopping_patience", 1200))
     early_stopping_min_delta = float(getattr(args, "early_stopping_min_delta", 1e-5))
     early_stopping_min_epochs = int(getattr(args, "early_stopping_min_epochs", 2000))
+    nonfinite_guard = bool(getattr(args, "nonfinite_guard", 1))
     best_total_loss = float("inf")
     no_improve_epochs = 0
     last_epoch = start_epoch - 1
@@ -231,12 +232,16 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
                 log_dict[term] = weighted_item
         total_loss_item = total_loss.detach().cpu().item()
         if not np.isfinite(total_loss_item):
-            print(
-                f"[Fitting] Non-finite total_loss at epoch {epoch}. "
-                "Skipping optimizer step for this epoch."
+            if nonfinite_guard:
+                print(
+                    f"[Fitting] Non-finite total_loss at epoch {epoch}. "
+                    "Skipping optimizer step for this epoch."
+                )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            raise FloatingPointError(
+                f"[Fitting] Non-finite total_loss at epoch {epoch} and nonfinite_guard=0."
             )
-            optimizer.zero_grad(set_to_none=True)
-            continue
         writer.add_scalar('TrainWeighted/total_loss', total_loss_item, epoch)
         current_lr = float(optimizer.param_groups[0]["lr"])
         writer.add_scalar('Train/lr', current_lr, epoch)
@@ -271,7 +276,9 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
             print(args.name_target)
 
         # logging
-        viz_fitting_static(epoch, log_path, warped_mesh, getattr(mesh_losser, "target_mesh"), args)
+        viz_freq = int(getattr(args, "viz_freq", 0))
+        if viz_freq > 0 and (epoch % max(1, viz_freq) == 0 or epoch == args.epochs - 1):
+            viz_fitting_static(epoch, log_path, warped_mesh, getattr(mesh_losser, "target_mesh"), args)
 
         # gradient descent
         optimizer.zero_grad()

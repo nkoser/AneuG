@@ -17,6 +17,7 @@ from ghd.losses.diceloss import BinaryDiceLoss, BinaryDiceLoss_Weighted
 import math
 import pyvista as pv
 import trimesh
+import itertools
 
 
 class Mesh_loss_differentiable_occupancy(Mesh_loss):
@@ -37,7 +38,61 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         self.root_target = args.root_target
         self.name_target = args.name_target
         self.weights_attention = None
+        self.opening_match_mode = str(getattr(args, "opening_match_mode", "permutation")).strip().lower()
+        self.opening_normal_bidirectional = bool(int(getattr(args, "opening_normal_bidirectional", 1)))
         super(Mesh_loss_differentiable_occupancy, self).__init__(mesh_std=base_shape, sample_num=self.sample_num)
+
+    def _solve_opening_assignment(self, warped_openings):
+        num_pairs = min(len(warped_openings), len(self.target_openings))
+        if num_pairs <= 1 or self.opening_match_mode in ("none", "index", "identity"):
+            return list(range(num_pairs))
+
+        warped_points = []
+        target_points = []
+        for i in range(num_pairs):
+            warped_points.append(
+                self._safe_sample_points_from_meshes(
+                    warped_openings[i], self.op_sample_num, return_normals=False
+                )
+            )
+            target_points.append(
+                self._safe_sample_points_from_meshes(
+                    self.target_openings[i].to(self.device), self.op_sample_num, return_normals=False
+                )
+            )
+
+        cost = np.zeros((num_pairs, num_pairs), dtype=np.float64)
+        for i in range(num_pairs):
+            for j in range(num_pairs):
+                loss_p, _ = chamfer_distance(warped_points[i], target_points[j], x_normals=None, y_normals=None)
+                cost[i, j] = float(loss_p.detach().cpu().item())
+
+        if num_pairs <= 8:
+            best_perm = None
+            best_score = np.inf
+            for perm in itertools.permutations(range(num_pairs), num_pairs):
+                score = float(np.sum([cost[i, perm[i]] for i in range(num_pairs)]))
+                if score < best_score:
+                    best_score = score
+                    best_perm = list(perm)
+            return best_perm if best_perm is not None else list(range(num_pairs))
+
+        # Greedy fallback for larger opening counts.
+        used = set()
+        assign = []
+        for i in range(num_pairs):
+            row = np.argsort(cost[i])
+            pick = None
+            for j in row:
+                jj = int(j)
+                if jj not in used:
+                    pick = jj
+                    break
+            if pick is None:
+                pick = int(row[0])
+            used.add(pick)
+            assign.append(pick)
+        return assign
 
     def get_static_mask_probabilistic(self):
         device = torch.device('cpu')
@@ -305,14 +360,23 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         loss_p_list = []
         loss_n_list = []
         if ('loss_openings_p' in loss_weighting) or ('loss_openings_n' in loss_weighting):
-            for idx in range(len(self.target_openings)):
+            num_pairs = min(len(warped_openings), len(self.target_openings))
+            assignment = self._solve_opening_assignment(warped_openings)
+            for idx in range(num_pairs):
+                trg_idx = int(assignment[idx]) if idx < len(assignment) else idx
                 pcd_wo, nor_wo = self._safe_sample_points_from_meshes(
                     warped_openings[idx], self.op_sample_num, return_normals=True
                 )
                 pcd_to, nor_to = self._safe_sample_points_from_meshes(
-                    self.target_openings[idx].to(self.device), self.op_sample_num, return_normals=True
+                    self.target_openings[trg_idx].to(self.device), self.op_sample_num, return_normals=True
                 )
                 loss_p, loss_n = chamfer_distance(pcd_wo, pcd_to, x_normals=nor_wo, y_normals=nor_to)
+                if self.opening_normal_bidirectional:
+                    _, loss_n_flip = chamfer_distance(
+                        pcd_wo, pcd_to, x_normals=nor_wo, y_normals=(-1.0 * nor_to)
+                    )
+                    if torch.isfinite(loss_n_flip):
+                        loss_n = torch.minimum(loss_n, loss_n_flip)
                 loss_p_list.append(loss_p if torch.isfinite(loss_p) else torch.Tensor([0.0]).to(self.device))
                 loss_n_list.append(loss_n if torch.isfinite(loss_n) else torch.Tensor([0.0]).to(self.device))
             if 'loss_openings_p' in loss_weighting:

@@ -5,6 +5,8 @@ import os
 import logging
 import pickle
 import fnmatch
+import subprocess
+import sys
 from ghd.fitting.registration import RegistrationwOpeningAlignmentwDifferentiableCentreline
 import torch
 import random
@@ -12,6 +14,7 @@ import yaml
 import numpy as np
 from typing import List, Optional, Sequence
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # conf
 DEFAULTS = {
@@ -24,7 +27,7 @@ DEFAULTS = {
     "name_canonical": "canonical_typeB",
     "name_target": "AN213_full_clean",
     "case_glob": "*",
-    "viz_freq": 200,
+    "viz_freq": 1000,
     "chk_freq": None,
     "log_freq": 100,
     "lr": 0.00075,
@@ -40,6 +43,7 @@ DEFAULTS = {
     "early_stopping_patience": 1200,
     "early_stopping_min_delta": 1e-5,
     "early_stopping_min_epochs": 2000,
+    "nonfinite_guard": 1,
     "num_op": 3,
     "num_Basis": 13 ** 2,
     "mix_lap_weights": [1.0, 0.1, 0.1],
@@ -58,9 +62,12 @@ DEFAULTS = {
     "attention_smooth": 0.02,
     "do_number": 25000,
     "weighter_style": "strategy_v1_linear",
+    "opening_match_mode": "permutation",  # permutation | index
+    "opening_normal_bidirectional": 1,  # 1: sign-invariant opening normal loss
     "mesh_filename": "part_aligned.obj",
     "redo_registration": 0,
     "auto_opening_method": "normals",  # normals | legacy
+    "auto_registration_mode": "load_or_compute",  # load_or_compute | batch_exact
     "auto_min_loop_vertices": 24,
     "auto_normal_dot_min": 0.72,
     "auto_face_dot_min": 0.90,
@@ -70,6 +77,8 @@ DEFAULTS = {
     "render_auto_registration_only": 0,
     "render_auto_registration_overwrite": 0,
     "render_auto_registration_dir": "./checkpoints/auto_registration_qc",
+    "parallel_cases": 1,
+    "parallel_devices": "",
     "loss_weighting": {
         "loss_do": 1.0,
         "loss_p0": 1.0 * 1,
@@ -320,6 +329,105 @@ def render_auto_registration_qc(args, labels: List[str]) -> None:
     print(f"Auto-registration render done. ok={ok} skipped={skipped} failed={failed} output={out_dir}")
 
 
+def _fit_case_sequential(args, label: str, loss_weighting: dict) -> None:
+    args.name_target = label
+    print('Now performing ghd fitting for case {}'.format(label))
+    case_log_root = os.path.join(args.save_root, args.name_target, args.meta)
+    done_markers = [
+        os.path.join(case_log_root, "ghb_fitting_checkpoint.pkl"),
+        os.path.join(case_log_root, "ghd_fitting_checkpoint.pkl"),  # backward compatibility
+    ]
+    if not any(os.path.exists(path) for path in done_markers):
+        copied_loss_weighting = loss_weighting.copy()
+        fit_ghd(args, copied_loss_weighting, hard_normalize=True, keep_size=True)
+    else:
+        print("Skipping ghd fitting for case {}".format(label))
+
+
+def _parse_parallel_devices(parallel_devices: str, fallback_device: str) -> List[str]:
+    parsed = [d.strip() for d in str(parallel_devices).split(",") if d.strip()]
+    if len(parsed) == 0:
+        return [str(fallback_device)]
+    return parsed
+
+
+def _run_single_case_subprocess(
+    script_path: str,
+    passthrough_argv: List[str],
+    label: str,
+    device: str,
+) -> int:
+    cmd = [
+        sys.executable,
+        script_path,
+        *passthrough_argv,
+        "--register",
+        "0",
+        "--render_auto_registration",
+        "0",
+        "--render_auto_registration_only",
+        "0",
+        "--parallel_cases",
+        "1",
+        "--case_glob",
+        label,
+        "--name_target",
+        label,
+        "--device",
+        device,
+    ]
+    print(f"[parallel] start case={label} device={device}")
+    result = subprocess.run(cmd, check=False)
+    print(f"[parallel] done  case={label} device={device} rc={result.returncode}")
+    return int(result.returncode)
+
+
+def _fit_cases_parallel(args, labels: List[str], passthrough_argv: List[str]) -> None:
+    workers = max(1, int(getattr(args, "parallel_cases", 1)))
+    workers = min(workers, len(labels))
+    devices = _parse_parallel_devices(getattr(args, "parallel_devices", ""), args.device)
+    print(
+        f"Parallel case fitting enabled: workers={workers}, devices={devices}, "
+        f"num_cases={len(labels)}"
+    )
+    if len(devices) == 1 and workers > 1:
+        print(
+            f"WARNING: {workers} workers share a single device ({devices[0]}). "
+            "This can increase total runtime or trigger OOM."
+        )
+
+    script_path = os.path.abspath(__file__)
+    failures = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_meta = {}
+        for i, label in enumerate(labels):
+            device = devices[i % len(devices)]
+            fut = pool.submit(
+                _run_single_case_subprocess,
+                script_path,
+                passthrough_argv,
+                label,
+                device,
+            )
+            future_to_meta[fut] = (label, device)
+
+        for fut in as_completed(future_to_meta):
+            label, device = future_to_meta[fut]
+            try:
+                rc = int(fut.result())
+            except Exception as e:
+                failures.append((label, device, -1, f"{type(e).__name__}: {e}"))
+                continue
+            if rc != 0:
+                failures.append((label, device, rc, "non-zero exit code"))
+
+    if len(failures) > 0:
+        print("Parallel fitting failures:")
+        for label, device, rc, msg in failures:
+            print(f"  - case={label} device={device} rc={rc} reason={msg}")
+        raise RuntimeError(f"{len(failures)} case(s) failed during parallel fitting.")
+
+
 parser = argparse.ArgumentParser("ghb_fitting_oa")
 parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
 parser.add_argument("--register", type=int, default=1)
@@ -346,6 +454,7 @@ parser.add_argument('--early_stopping', type=int, default=DEFAULTS["early_stoppi
 parser.add_argument('--early_stopping_patience', type=int, default=DEFAULTS["early_stopping_patience"]) # epochs with no sufficient improvement
 parser.add_argument('--early_stopping_min_delta', type=float, default=DEFAULTS["early_stopping_min_delta"]) # minimal improvement to reset patience
 parser.add_argument('--early_stopping_min_epochs', type=int, default=DEFAULTS["early_stopping_min_epochs"]) # warmup epochs before early stopping can trigger
+parser.add_argument('--nonfinite_guard', type=int, default=DEFAULTS["nonfinite_guard"]) # 1: skip optimizer step on non-finite total loss
 parser.add_argument('--num_op', type=int, default=DEFAULTS["num_op"]) # number of operators to use for fitting, can be adjusted based on the complexity of the meshes and the desired level of detail in the fitting. More operators may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the loss weights.
 parser.add_argument('--num_Basis', type=int, default=DEFAULTS["num_Basis"]) # number of basis functions to use for fitting, can be adjusted based on the desired level of detail in the fitting.
 parser.add_argument('--mix_lap_weights', type=list, default=DEFAULTS["mix_lap_weights"]) # weights for the mixed Laplacian regularization terms, can be adjusted to balance the smoothness and fidelity of the fitting.
@@ -365,9 +474,12 @@ parser.add_argument('--attention_max_w', type=float, default=DEFAULTS["attention
 parser.add_argument('--attention_smooth', type=float, default=DEFAULTS["attention_smooth"]) # smoothing factor for the attention mechanism in the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the characteristics of the meshes. A larger smoothing factor may help to improve the robustness of the registration by reducing the influence of outliers, but may also require more careful tuning of the learning rate and loss weights.
 parser.add_argument('--do_number', type=int, default=DEFAULTS["do_number"]) # number of points to use for the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the computational resources available. More points may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the learning rate and loss weights.
 parser.add_argument('--weighter_style', type=str, default=DEFAULTS["weighter_style"]) # style for the weighter in the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the characteristics of the meshes. Different styles may use different weighting strategies and may require different tuning of the learning rate and loss weights.
+parser.add_argument('--opening_match_mode', type=str, default=DEFAULTS["opening_match_mode"]) # opening branch matching mode: permutation | index
+parser.add_argument('--opening_normal_bidirectional', type=int, default=DEFAULTS["opening_normal_bidirectional"]) # if 1, opening normal loss is sign-invariant
 parser.add_argument('--mesh_filename', type=str, default=DEFAULTS["mesh_filename"]) # mesh filename inside each target subfolder (e.g., part_aligned.obj). If not found, falls back to <root>/<label>.obj
 parser.add_argument('--redo_registration', type=int, default=DEFAULTS["redo_registration"]) # force regeneration of opening/centreline checkpoints
 parser.add_argument('--auto_opening_method', type=str, default=DEFAULTS["auto_opening_method"]) # normals | legacy
+parser.add_argument('--auto_registration_mode', type=str, default=DEFAULTS["auto_registration_mode"]) # load_or_compute | batch_exact
 parser.add_argument('--auto_min_loop_vertices', type=int, default=DEFAULTS["auto_min_loop_vertices"]) # min vertices for automatic opening loops
 parser.add_argument('--auto_normal_dot_min', type=float, default=DEFAULTS["auto_normal_dot_min"]) # normal threshold for normals-based auto registration
 parser.add_argument('--auto_face_dot_min', type=float, default=DEFAULTS["auto_face_dot_min"]) # face threshold for normals-based auto registration
@@ -377,6 +489,8 @@ parser.add_argument('--render_auto_registration', type=int, default=DEFAULTS["re
 parser.add_argument('--render_auto_registration_only', type=int, default=DEFAULTS["render_auto_registration_only"]) # stop after auto registration rendering
 parser.add_argument('--render_auto_registration_overwrite', type=int, default=DEFAULTS["render_auto_registration_overwrite"]) # overwrite existing render pngs
 parser.add_argument('--render_auto_registration_dir', type=str, default=DEFAULTS["render_auto_registration_dir"]) # output dir for auto registration render pngs
+parser.add_argument('--parallel_cases', type=int, default=DEFAULTS["parallel_cases"]) # number of cases to fit in parallel via subprocesses
+parser.add_argument('--parallel_devices', type=str, default=DEFAULTS["parallel_devices"]) # comma-separated device list used round-robin for parallel cases
 
 pre_args, _ = parser.parse_known_args()
 config_path = pre_args.config
@@ -429,12 +543,37 @@ if register:
         return os.path.join(case_root, case_name, ckpt_name), os.path.join(case_root, case_name, ckpt_file)
 
     auto_opening_method = str(getattr(args, "auto_opening_method", "normals"))
+    auto_registration_mode = str(getattr(args, "auto_registration_mode", "load_or_compute")).strip().lower()
     auto_kwargs = {
         "min_loop_vertices": int(getattr(args, "auto_min_loop_vertices", 24)),
         "normal_dot_min": float(getattr(args, "auto_normal_dot_min", 0.72)),
         "face_dot_min": float(getattr(args, "auto_face_dot_min", 0.90)),
     }
     redo_registration = bool(getattr(args, "redo_registration", 0))
+
+    def _recompute_case_registration_batch_exact(target, opa_chk_path, cl_chk_path):
+        method = str(auto_opening_method).strip().lower()
+        target._reset_opening_state()
+        if method in ("legacy", "auto", "default"):
+            target.register_openings_auto(
+                min_loop_vertices=int(auto_kwargs["min_loop_vertices"])
+            )
+        elif method in ("normals", "auto_normals", "normal"):
+            target.register_openings_auto_normals(
+                min_loop_vertices=int(auto_kwargs["min_loop_vertices"]),
+                normal_dot_min=float(auto_kwargs["normal_dot_min"]),
+                face_dot_min=float(auto_kwargs["face_dot_min"]),
+            )
+        else:
+            raise ValueError(
+                f"Unknown auto_opening_method='{auto_opening_method}'. Use legacy or normals."
+            )
+        target.create_opening_meshes(viz=False)
+        target.save_checkpoint_opa(opa_chk_path)
+        target.register_centreline_end_points(auto=True)
+        target._cast_waves(progress=False)
+        target.save_checkpoint_centreline(cl_chk_path)
+
     for label in label_list:
         args.name_target = label
         opa_chk_path, opa_chk_file = _checkpoint_paths(
@@ -460,14 +599,21 @@ if register:
             redo_opa = bool(redo_registration or (not has_opa))
             # Keep centreline consistent with refreshed openings.
             redo_cl = bool(redo_registration or (not has_cl) or redo_opa)
-            target.load_checkpoint_opa(
-                opa_chk_path,
-                redo=redo_opa,
-                auto=True,
-                auto_method=auto_opening_method,
-                auto_kwargs=auto_kwargs,
-            )
-            target.load_checkpoint_centreline(cl_chk_path, redo=redo_cl, auto=True)
+            if auto_registration_mode == "batch_exact":
+                _recompute_case_registration_batch_exact(
+                    target=target,
+                    opa_chk_path=opa_chk_path,
+                    cl_chk_path=cl_chk_path,
+                )
+            else:
+                target.load_checkpoint_opa(
+                    opa_chk_path,
+                    redo=redo_opa,
+                    auto=True,
+                    auto_method=auto_opening_method,
+                    auto_kwargs=auto_kwargs,
+                )
+                target.load_checkpoint_centreline(cl_chk_path, redo=redo_cl, auto=True)
             norm_target = torch.max(torch.norm(getattr(target, "mesh_target_p3d").verts_packed(), dim=-1)).detach().item()
             target.class_normalize(norm=norm_target)
             target.centreline_clean(radius=0.5 / norm_target)
@@ -480,16 +626,9 @@ if bool(getattr(args, "render_auto_registration", 0)):
         raise SystemExit(0)
 
 # perform ghd fitting
-for label in label_list:
-    args.name_target = label
-    print('Now performing ghd fitting for case {}'.format(label))
-    case_log_root = os.path.join(args.save_root, args.name_target, args.meta)
-    done_markers = [
-        os.path.join(case_log_root, "ghb_fitting_checkpoint.pkl"),
-        os.path.join(case_log_root, "ghd_fitting_checkpoint.pkl"),  # backward compatibility
-    ]
-    if not any(os.path.exists(path) for path in done_markers):
-        copied_loss_weighting = loss_weighting.copy()
-        fit_ghd(args, copied_loss_weighting, hard_normalize=True, keep_size=True)
-    else:
-        print("Skipping ghd fitting for case {}".format(label))
+parallel_cases = max(1, int(getattr(args, "parallel_cases", 1)))
+if parallel_cases > 1 and len(label_list) > 1:
+    _fit_cases_parallel(args=args, labels=label_list, passthrough_argv=sys.argv[1:])
+else:
+    for label in label_list:
+        _fit_case_sequential(args, label, loss_weighting)
