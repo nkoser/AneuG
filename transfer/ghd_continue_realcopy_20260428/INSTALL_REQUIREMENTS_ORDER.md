@@ -51,6 +51,9 @@ python -m pip install -r /workspace/AneuG/transfer/ghd_continue_realcopy_2026042
 python -m pip install -r /workspace/AneuG/transfer/ghd_continue_realcopy_20260428/requirements_pyg_torch28_cuda126.txt
 ```
 
+Die PyTorch-Datei nutzt bewusst `torch==2.8.0` ohne `+cu126`; der CUDA-Index
+waehlt dann das passende CUDA-Wheel.
+
 Siehe auch:
 
 ```text
@@ -62,6 +65,9 @@ Siehe auch:
 ```bash
 python -m pip install -r /workspace/AneuG/transfer/ghd_continue_realcopy_20260428/requirements_torch_cuda128.txt
 ```
+
+Auch hier steht in der Requirements-Datei bewusst `torch==2.8.0` ohne
+`+cu128`; der Index bestimmt das CUDA-Wheel.
 
 Schnelltest:
 

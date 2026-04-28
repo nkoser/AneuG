@@ -20,6 +20,8 @@ Server ist diese Reihenfolge am sinnvollsten:
 
 Damit bleibt die Torch-Major/Minor-Version identisch zur aktuellen Umgebung
 (`torch==2.8.0`), aber die CUDA-Wheels sind konservativer als `cu128`.
+Wichtig: Beim PyTorch CUDA-Index wird `torch==2.8.0` angegeben, nicht
+`torch==2.8.0+cu126`; der Index waehlt dann das CUDA-12.6-Wheel.
 
 ```bash
 conda create -n unified_env python=3.10 -y
@@ -47,6 +49,22 @@ PY
 
 Wenn dieser Test laeuft, nimm diese Umgebung fuer das Resume.
 
+Wenn `pip` trotz Python 3.10 und x86_64 gar keine Torch-Versionen findet
+(`from versions: none`), pruefe `glibc`:
+
+```bash
+python - <<'PY'
+import platform
+print(platform.platform())
+PY
+```
+
+Bei `glibc2.27` siehe:
+
+```text
+/workspace/AneuG/transfer/ghd_continue_realcopy_20260428/GLIBC_227_FALLBACK.md
+```
+
 ## Falls CUDA 12.6 Wheels nicht laufen
 
 Dann gibt es zwei saubere Optionen:
@@ -57,7 +75,7 @@ Dann gibt es zwei saubere Optionen:
 
 Option 2 kann funktionieren, ist aber fuer das direkte Resume weniger schoen,
 weil die Checkpoints in der aktuellen Umgebung mit Torch 2.8 geschrieben wurden.
-Darum erst `torch==2.8.0+cu126` versuchen.
+Darum erst `torch==2.8.0` aus dem `cu126`-Index versuchen.
 
 ## Danach Fitting starten
 

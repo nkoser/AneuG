@@ -20,7 +20,11 @@ import vtk
 import pytorch3d as p3d
 import igraph as ig
 from tqdm import tqdm
-from skeletor.utilities import make_trimesh
+try:
+    from skeletor.utilities import make_trimesh
+except Exception:
+    def make_trimesh(mesh, validate=False):
+        return mesh
 import pyvista as pv
 from pytorch3d.io import save_obj, load_objs_as_meshes
 from pytorch3d.transforms import axis_angle_to_matrix, matrix_to_axis_angle
