@@ -68,3 +68,17 @@ uebernimm bitte diese zwei Dateien aus der aktuellen Version:
 utils/utils.py
 ghd/fitting/registration.py
 ```
+
+Oder direkt im Repo auf dem Zielserver:
+
+```bash
+cd /workspace/AneuG
+python /workspace/AneuG/transfer/ghd_continue_realcopy_20260428/patch_legacy_optional_imports.py
+```
+
+Wenn dein Repo dort unter `/home/sukin707/Aneug` liegt, entsprechend:
+
+```bash
+cd /home/sukin707/Aneug
+python /home/sukin707/Aneug/transfer/ghd_continue_realcopy_20260428/patch_legacy_optional_imports.py
+```

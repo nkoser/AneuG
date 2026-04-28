@@ -481,18 +481,24 @@ class Mesh_loss(nn.Module):
     def forward(self, meshes_scr: Meshes, trg: Union[Meshes, torch.Tensor], loss_list:dict, B=1):
         # calcualte all types of losses for self and meshes_scr
         loss_dict = {}
-        sample_scr, normals_scr = self._safe_sample_points_from_meshes(meshes_scr, self.sample_num, return_normals=True)
-        if isinstance(trg, Meshes):
-            sample_trg, normals_trg = self._safe_sample_points_from_meshes(trg, self.sample_num, return_normals=True)
-            loss_p0, loss_n1 = chamfer_distance(sample_scr, sample_trg, x_normals=normals_scr, y_normals=normals_trg)
-        else:
-            sample_trg = trg
-            loss_p0, loss_n1 = chamfer_distance(sample_scr, sample_trg, x_normals=None, y_normals=None)
-            loss_n1 = 1e-5
-        if 'loss_p0' in loss_list:
-            loss_dict['loss_p0'] = loss_p0 if not torch.isnan(loss_p0) else torch.Tensor([0.0]).to(self.device)
-        if 'loss_n1' in loss_list:
-            loss_dict['loss_n1'] = loss_n1 if not torch.isnan(loss_n1) else torch.Tensor([0.0]).to(self.device)
+        # Tier-A speedup: only run the (very expensive) global surface chamfer
+        # when a caller actually requested loss_p0 or loss_n1. The decap path
+        # in meshloss_do.forward_opa_do calls this method twice per epoch -
+        # once for surface losses, once for pure regularisation - and the old
+        # code sampled 2 * sample_num points unconditionally each time.
+        if any(k in loss_list for k in ('loss_p0', 'loss_n1')):
+            sample_scr, normals_scr = self._safe_sample_points_from_meshes(meshes_scr, self.sample_num, return_normals=True)
+            if isinstance(trg, Meshes):
+                sample_trg, normals_trg = self._safe_sample_points_from_meshes(trg, self.sample_num, return_normals=True)
+                loss_p0, loss_n1 = chamfer_distance(sample_scr, sample_trg, x_normals=normals_scr, y_normals=normals_trg)
+            else:
+                sample_trg = trg
+                loss_p0, loss_n1 = chamfer_distance(sample_scr, sample_trg, x_normals=None, y_normals=None)
+                loss_n1 = 1e-5
+            if 'loss_p0' in loss_list:
+                loss_dict['loss_p0'] = loss_p0 if not torch.isnan(loss_p0) else torch.Tensor([0.0]).to(self.device)
+            if 'loss_n1' in loss_list:
+                loss_dict['loss_n1'] = loss_n1 if not torch.isnan(loss_n1) else torch.Tensor([0.0]).to(self.device)
         if 'loss_laplacian' in loss_list:
             laplacain_vect = mesh_laplacian_smoothing(meshes_scr, method="cot")
             loss_dict['loss_laplacian'] = laplacain_vect if not torch.isnan(laplacain_vect) else torch.Tensor([0.0]).to(self.device)

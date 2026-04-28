@@ -1,0 +1,87 @@
+# Own-like fitting profile, but using auto-registration checkpoints.
+# Goal: closer behavior to AneuG-Own training dynamics.
+
+register: 1
+chk_num: 4
+epochs: 15000
+
+# Main args
+device: cuda:0
+root_template: ./checkpoints/alignment
+root_target: ./checkpoints/alignment
+name_canonical: canonical_typeB
+name_target: AN213_full_clean
+case_glob: "*"
+
+viz_freq: 200
+chk_freq: null
+log_freq: 100
+
+lr: 0.00075
+lr_scheduler: step
+step_size: 2500
+gamma: 0.75
+
+# Disabled to stay close to older training flow
+early_stopping: 0
+early_stopping_patience: 1200
+early_stopping_min_delta: 0.00001
+early_stopping_min_epochs: 2000
+nonfinite_guard: 0
+
+num_op: 3
+num_Basis: 144
+mix_lap_weights:
+  - 1.0
+  - 0.1
+  - 0.1
+sample_num: 250000
+op_sample_num: 1000
+op_clean_threshold: 0.2
+op_bold: 0
+
+save_root: /workspace/AneuG/checkpoints/ghd_fitting_auto_normals_own_like
+meta: own_like_auto_v1
+
+num_sp: 2
+do_dpi: 4
+do_style: number_control_v2
+do_loss_type: dice_loss_attention
+use_do_dropper: 0
+attention_max_w: 3.0
+attention_smooth: 0.02
+do_number: 25000
+weighter_style: strategy_v1_linear
+opening_match_mode: permutation
+opening_normal_bidirectional: 1
+mesh_filename: part_aligned.obj
+
+# Use existing auto checkpoints; do not recompute each run.
+redo_registration: 0
+auto_opening_method: normals
+auto_registration_mode: load_or_compute
+opa_checkpoint_name: opa_checkpoint_auto_normals_v1
+centreline_checkpoint_name: diff_centreline_checkpoint_auto_normals_v1
+
+# Optional QC rendering (off by default)
+render_auto_registration: 0
+render_auto_registration_only: 0
+render_auto_registration_overwrite: 0
+render_auto_registration_dir: /workspace/AneuG/checkpoints/auto_registration_qc_own_like
+
+# Optional: parallelize fitting across cases (subprocesses)
+parallel_cases: 1
+parallel_devices: "cuda:0"
+
+# Loss weights
+loss_weighting:
+  loss_do: 1.0
+  loss_p0: 1.0
+  loss_n1: 0.8
+  loss_laplacian: 0.1
+  loss_edge: 0.1
+  loss_consistency: 0.1
+  loss_rigid: 100.0
+  loss_openings_p: 5
+  loss_openings_n: 0.1
+  loss_diff_centreline: 10.0

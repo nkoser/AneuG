@@ -1,0 +1,117 @@
+# Cap-v8 profile for prepared3 aneurysm + 1 opening.
+# Improved opening fit:
+#   - more basis functions (196 vs 144) for sharper rim representation
+#   - higher opening sample count (4000 vs 1800) for stronger gradient signal
+#   - regularisation kept at v6 levels to prevent cap collapse
+#   - stronger opening losses (openings_p 12, openings_plane 20)
+#   - local rim vertex refinement pass after spectral fitting (Stage 2)
+#   - decap_chamfer: exclude cap faces from loss_p0 to remove conflicting
+#     gradients that pull cap vertices toward the dome surface
+
+register: 0
+chk_num: 4
+epochs: 15000
+
+# Main args
+device: cuda:0
+root_template: /workspace/AneuG/checkpoints
+root_target: /data/ghd_prepared_meshes_3_aneurysm_1op_new
+name_canonical: canonical_average
+name_target: item_Case7
+case_glob: "*"
+
+viz_freq: 300
+chk_freq: null
+log_freq: 100
+
+lr: 0.0012
+lr_scheduler: step
+step_size: 2500
+gamma: 0.8
+
+early_stopping: 1
+early_stopping_patience: 1200
+early_stopping_min_delta: 0.00001
+early_stopping_min_epochs: 2000
+nonfinite_guard: 1
+
+keep_size: 0
+grad_clip_norm: 1.0
+
+num_op: 1
+num_Basis: 196
+mix_lap_weights:
+  - 1.0
+  - 0.1
+  - 0.1
+sample_num: 260000
+op_sample_num: 4000
+op_clean_threshold: 0.2
+op_bold: 0
+
+save_root: /workspace/AneuG/checkpoints/ghd_fitting_prepared3_aneurysm_1op_cap_v8
+meta: prepared3_aneurysm_1op_quality_cap_v8
+
+num_sp: 2
+do_dpi: 4
+do_style: number_control_v2
+do_loss_type: dice_loss_attention
+use_do_dropper: 0
+attention_max_w: 3.0
+attention_smooth: 0.02
+do_number: 25000
+weighter_style: strategy_v1_linear
+opening_match_mode: index
+opening_normal_bidirectional: 1
+opening_loss_mode: boundary
+mesh_filename: part_aligned.obj
+
+redo_registration: 0
+auto_opening_method: normals
+auto_registration_mode: load_or_compute
+opa_checkpoint_name: opa_checkpoint_1op
+centreline_checkpoint_name: diff_centreline_checkpoint_1op
+
+render_auto_registration: 0
+render_auto_registration_only: 0
+render_auto_registration_overwrite: 0
+render_auto_registration_dir: /workspace/AneuG/checkpoints/auto_registration_qc_prepared3_aneurysm_1op
+
+parallel_cases: 1
+parallel_devices: "cuda:0"
+
+# --- Decap chamfer ---
+# NOTE: cap faces are NOT part of the mesh (open boundary), so this has no
+# effect in practice.  Kept for future meshes that might include caps.
+decap_chamfer: 0
+
+# --- Local rim vertex refinement (Stage 2) ---
+# After the spectral GHD fitting, a second optimisation pass runs where
+# only the vertices in the N-ring neighbourhood of each opening rim are
+# freed as direct vertex offsets.  This bypasses the spectral low-pass
+# limit and allows sharp, local adjustment at the ostium.
+rim_refine_enabled: 1
+rim_refine_epochs: 800
+rim_refine_lr: 0.0006
+rim_refine_rings: 3
+rim_refine_laplacian_weight: 0.15
+rim_refine_edge_weight: 0.10
+rim_refine_opening_p_weight: 14.0
+rim_refine_opening_plane_weight: 10.0
+rim_refine_surface_p_weight: 3.0
+rim_refine_grad_clip_norm: 0.5
+
+loss_weighting:
+  loss_do: 1.25
+  loss_p0: 1.5
+  loss_n1: 0.8
+  loss_laplacian: 0.12
+  loss_edge: 0.12
+  loss_consistency: 0.12
+  loss_rigid: 12.0
+  loss_openings_p: 12.0
+  loss_openings_surface_p: 3.0
+  loss_openings_n: 0.01
+  loss_openings_plane: 20.0
+  loss_diff_centreline: 1.0
+  loss_thickness: 0.05

@@ -631,24 +631,29 @@ def fit_ghd(args, loss_weighting, hard_normalize=True, keep_size=True, canonical
         log_dict = {'epoch': epoch}
         log_dict_raw = {'epoch': epoch}
         should_log = (epoch % args.log_freq == 0) or (epoch == args.epochs - 1)
+        # Tier-A speedup: only force a CPU<->GPU sync per loss term when we
+        # actually need to log/plot/print. The default loop accumulates the
+        # weighted total on-device and syncs once at the end.
         for term, loss in loss_dict.items():
             if term not in ['loss_openings_p', 'loss_openings_n']:
-                raw_item = loss.detach().cpu().item()
-                weighted_item = (loss * loc_loss_weighting[term]).detach().cpu().item()
-                total_loss += loss * loc_loss_weighting[term]
-                log_dict_raw[term] = raw_item
-                log_dict[term] = weighted_item
+                weighted = loss * loc_loss_weighting[term]
+                total_loss = total_loss + weighted
                 if should_log:
+                    raw_item = loss.detach().cpu().item()
+                    weighted_item = weighted.detach().cpu().item()
+                    log_dict_raw[term] = raw_item
+                    log_dict[term] = weighted_item
                     writer.add_scalar('TrainRaw/' + term, raw_item, epoch)
                     writer.add_scalar('TrainWeighted/' + term, weighted_item, epoch)
             else:
                 loss_openings = torch.sum(torch.stack(loss), dim=0)
-                raw_item = loss_openings.detach().cpu().item()
-                weighted_item = (loss_openings * loc_loss_weighting[term]).detach().cpu().item()
-                total_loss += loss_openings * loc_loss_weighting[term]
-                log_dict_raw[term] = raw_item
-                log_dict[term] = weighted_item
+                weighted = loss_openings * loc_loss_weighting[term]
+                total_loss = total_loss + weighted
                 if should_log:
+                    raw_item = loss_openings.detach().cpu().item()
+                    weighted_item = weighted.detach().cpu().item()
+                    log_dict_raw[term] = raw_item
+                    log_dict[term] = weighted_item
                     writer.add_scalar('TrainRaw/' + term, raw_item, epoch)
                     writer.add_scalar('TrainWeighted/' + term, weighted_item, epoch)
         total_loss_item = total_loss.detach().cpu().item()
