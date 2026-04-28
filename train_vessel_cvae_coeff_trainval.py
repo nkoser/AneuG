@@ -68,6 +68,9 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=5e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--condition_dropout", type=float, default=0.15)
+    p.add_argument("--uncond_warmup", type=int, default=0,
+                   help="For first N epochs, drop condition entirely (decoder learns p(x) before p(x|c))."
+                        " After N epochs, condition is gradually re-introduced via condition_dropout.")
     p.add_argument("--ghd_noise_std", type=float, default=0.0,
                    help="Std of Gaussian noise added to GHD encoder input during training")
     p.add_argument("--ghd_mask_prob", type=float, default=0.0,
@@ -269,7 +272,11 @@ def loss_for_batch(generator, conditioner, batch, args, device, epoch, train):
     vessel = batch["vessel_pts"].to(device)
     cond = conditioner(vessel, ostium)
     if train:
-        cond = maybe_drop_condition(cond, args.condition_dropout)
+        if args.uncond_warmup > 0 and epoch < args.uncond_warmup:
+            # Force decoder to learn p(x) by zeroing all condition signals.
+            cond = torch.zeros_like(cond)
+        else:
+            cond = maybe_drop_condition(cond, args.condition_dropout)
         ghd_in = maybe_corrupt_ghd_input(ghd, args.ghd_noise_std, args.ghd_mask_prob)
     else:
         ghd_in = ghd
