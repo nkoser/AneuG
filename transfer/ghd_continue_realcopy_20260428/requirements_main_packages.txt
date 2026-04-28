@@ -1,0 +1,17 @@
+numpy==1.26.4
+scipy==1.15.3
+matplotlib==3.10.8
+PyYAML==6.0.3
+tqdm==4.67.3
+trimesh==4.11.2
+scikit-learn==1.7.2
+pandas==2.3.3
+einops==0.8.2
+igraph==1.0.0
+networkx==3.4.2
+shapely==2.1.2
+point-cloud-utils==0.34.0
+skeletor==1.4.0
+pyvista==0.47.0
+vtk==9.2.6
+open3d==0.18.0
