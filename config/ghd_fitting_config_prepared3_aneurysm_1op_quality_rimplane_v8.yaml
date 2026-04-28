@@ -1,0 +1,90 @@
+# Rim+plane prioritized profile for prepared3 aneurysm + 1 opening.
+# Primary supervision: ostium rim + opening plane.
+# Surface-cap supervision stays secondary and uses repaired/original target openings.
+
+register: 0
+chk_num: 4
+epochs: 15000
+
+# Main args
+device: cuda:0
+root_template: /workspace/AneuG/checkpoints
+root_target: /data/ghd_prepared_meshes_3_aneurysm_1op_new
+name_canonical: canonical_average
+name_target: item_Case7
+case_glob: "*"
+
+viz_freq: 300
+chk_freq: null
+log_freq: 100
+
+lr: 0.0012
+lr_scheduler: step
+step_size: 2500
+gamma: 0.8
+
+early_stopping: 1
+early_stopping_patience: 1200
+early_stopping_min_delta: 0.00001
+early_stopping_min_epochs: 2000
+nonfinite_guard: 1
+
+keep_size: 0
+grad_clip_norm: 1.0
+
+num_op: 1
+num_Basis: 144
+mix_lap_weights:
+  - 1.0
+  - 0.1
+  - 0.1
+sample_num: 260000
+op_sample_num: 1800
+op_clean_threshold: 0.2
+op_bold: 0
+
+save_root: /workspace/AneuG/checkpoints/ghd_fitting_prepared3_aneurysm_1op_rimplane_v8
+meta: prepared3_aneurysm_1op_quality_rimplane_v8
+
+num_sp: 2
+do_dpi: 4
+do_style: number_control_v2
+do_loss_type: dice_loss_attention
+use_do_dropper: 0
+attention_max_w: 3.0
+attention_smooth: 0.02
+do_number: 25000
+weighter_style: strategy_v1_linear
+opening_match_mode: index
+opening_normal_bidirectional: 1
+opening_loss_mode: rim_plane
+mesh_filename: part_aligned.obj
+
+redo_registration: 0
+auto_opening_method: normals
+auto_registration_mode: load_or_compute
+opa_checkpoint_name: opa_checkpoint_1op
+centreline_checkpoint_name: diff_centreline_checkpoint_1op
+
+render_auto_registration: 0
+render_auto_registration_only: 0
+render_auto_registration_overwrite: 0
+render_auto_registration_dir: /workspace/AneuG/checkpoints/auto_registration_qc_prepared3_aneurysm_1op
+
+parallel_cases: 1
+parallel_devices: "cuda:0"
+
+loss_weighting:
+  loss_do: 1.25
+  loss_p0: 1.5
+  loss_n1: 0.8
+  loss_laplacian: 0.12
+  loss_edge: 0.12
+  loss_consistency: 0.12
+  loss_rigid: 12.0
+  loss_openings_p: 8.0
+  loss_openings_surface_p: 0.75
+  loss_openings_n: 0.01
+  loss_openings_plane: 20.0
+  loss_diff_centreline: 1.0
+  loss_thickness: 0.05

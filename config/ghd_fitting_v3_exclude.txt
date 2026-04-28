@@ -1,0 +1,2 @@
+# Cases excluded from v3 round-robin fitting (broken geometry / DO sampling failure)
+aneux_p424_FBQUDgUaDBQVChMdFhQICgAK

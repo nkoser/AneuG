@@ -113,7 +113,7 @@ class Graph_Harmonic_Deform(nn.Module):
 
 
 class Graph_Harmonic_Deform_opening_alignment_dynamic(Graph_Harmonic_Deform):
-    def __init__(self, args, oa_class: RegistrationwOpeningAlignment):
+    def __init__(self, args, oa_class: RegistrationwOpeningAlignment, eigen_chk=None):
         self.device = torch.device(args.device)
         base_shape = getattr(oa_class, "mesh_target_p3d").to(self.device)
         for attr_name in ["op_rec_v_indices_map", "op_rec_f"]:
@@ -127,7 +127,8 @@ class Graph_Harmonic_Deform_opening_alignment_dynamic(Graph_Harmonic_Deform):
                                            faces=[torch.tensor(self.op_rec_f[idx], dtype=torch.int64, device=self.device)]))  # use non-mapped face indices
         super(Graph_Harmonic_Deform_opening_alignment_dynamic, self).__init__(base_shape=base_shape,
                                                                               num_Basis=args.num_Basis,
-                                                                              mix_lap_weight=args.mix_lap_weights)
+                                                                              mix_lap_weight=args.mix_lap_weights,
+                                                                              eigen_chk=eigen_chk)
 
     def forward_with_opening_alignment(self, GHB_coefficient=None):
         if GHB_coefficient is None:

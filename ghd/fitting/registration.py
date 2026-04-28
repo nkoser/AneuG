@@ -43,9 +43,32 @@ class RegistrationwOpeningAlignment(object):
                  mesh_path = alt_path
         
         print(f"Loading mesh from: {mesh_path}")
-        self.mesh_target = o3d.io.read_triangle_mesh(mesh_path)
-        self.mesh_target_trimesh = trimesh.load(mesh_path)
-        self.mesh_target_p3d = o3d_mesh_to_pytorch3d(self.mesh_target)
+        mesh_trimesh = trimesh.load(mesh_path, process=False)
+        if isinstance(mesh_trimesh, trimesh.Scene):
+            if len(mesh_trimesh.geometry) == 0:
+                raise ValueError("Loaded trimesh scene is empty.")
+            mesh_trimesh = trimesh.util.concatenate(tuple(mesh_trimesh.geometry.values()))
+        if not isinstance(mesh_trimesh, trimesh.Trimesh):
+            mesh_o3d = o3d.io.read_triangle_mesh(mesh_path)
+            mesh_trimesh = trimesh.Trimesh(
+                vertices=np.asarray(mesh_o3d.vertices),
+                faces=np.asarray(mesh_o3d.triangles),
+                process=False,
+            )
+
+        verts = np.asarray(mesh_trimesh.vertices, dtype=np.float64)
+        faces = np.asarray(mesh_trimesh.faces, dtype=np.int64)
+        self.mesh_target_trimesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        # Keep open3d and trimesh in the same vertex/face indexing order.
+        self.mesh_target = o3d.geometry.TriangleMesh()
+        self.mesh_target.vertices = o3d.utility.Vector3dVector(verts)
+        self.mesh_target.triangles = o3d.utility.Vector3iVector(faces)
+        self.mesh_target.compute_vertex_normals()
+
+        verts_t = torch.from_numpy(verts).float()
+        faces_t = torch.from_numpy(faces).long()
+        self.mesh_target_p3d = Meshes(verts=[verts_t], faces=[faces_t])
         self.num_op = num_op  # number of openings
         # assembly of opening v indices (num_op, N), v coordinates (num_op, N, 3), n (num_op, N, 3)
         self.op_v_indices, self.op_v_coords, self.op_v_normal, self.op_n_mean = [], [], [], []
@@ -53,8 +76,12 @@ class RegistrationwOpeningAlignment(object):
         self.op_rec_v, self.op_rec_f = [], []
         # assembly of mapped reconstructed plane meshes
         self.op_rec_v_indices_map, self.op_rec_f_map = [], []
-        # optional metadata for automatic registration
+        # optional metadata for automatic registration and repaired target supervision
         self.op_tangent, self.op_cut_points = [], []
+        self.op_target_rim_v, self.op_target_rec_v, self.op_target_rec_f = [], [], []
+        self.op_target_plane_center, self.op_target_plane_normal = [], []
+        self.op_source_kind, self.op_source_surface_v, self.op_source_surface_f = [], [], []
+        self.op_target_debug = []
         self.auto_centreline_summary = None
         self.auto_registration_debug = {}
         self._auto_reg_pending_debug = None
@@ -65,6 +92,10 @@ class RegistrationwOpeningAlignment(object):
         self.op_rec_v, self.op_rec_f = [], []
         self.op_rec_v_indices_map, self.op_rec_f_map = [], []
         self.op_tangent, self.op_cut_points = [], []
+        self.op_target_rim_v, self.op_target_rec_v, self.op_target_rec_f = [], [], []
+        self.op_target_plane_center, self.op_target_plane_normal = [], []
+        self.op_source_kind, self.op_source_surface_v, self.op_source_surface_f = [], [], []
+        self.op_target_debug = []
 
     def _get_mesh_graph_cache(self) -> Dict[str, object]:
         if self._mesh_graph_cache is not None:
@@ -2616,6 +2647,19 @@ class RegistrationwOpeningAlignment(object):
                'op_tangent': getattr(self, "op_tangent", []),
                'op_cut_points': getattr(self, "op_cut_points", []),
                'auto_registration_debug': getattr(self, "auto_registration_debug", {})}
+        for key in [
+            "op_target_rim_v",
+            "op_target_rec_v",
+            "op_target_rec_f",
+            "op_target_plane_center",
+            "op_target_plane_normal",
+            "op_source_kind",
+            "op_source_surface_v",
+            "op_source_surface_f",
+            "op_target_debug",
+        ]:
+            if hasattr(self, key):
+                chk[key] = getattr(self, key)
         # use self.op_rec_f to offset opening meshes, use self.op_rec_f_map if creating opening meshes from mother mesh
         if not chk_path.endswith('.pkl'):
             chk_path += '.pkl'
@@ -2673,12 +2717,69 @@ class RegistrationwOpeningAlignment(object):
     def return_opening_Meshes_static(self, register_normal=True) -> list:
         # return opening meshes for non-canonical shapes (static)
         opening_Meshes = []
+        target_rec_v = getattr(self, "op_target_rec_v", [])
+        target_rec_f = getattr(self, "op_target_rec_f", [])
+        target_plane_normal = getattr(self, "op_target_plane_normal", [])
         for idx in range(self.num_op):
-            verts = torch.tensor(self.op_rec_v[idx]).unsqueeze(0).float()
-            faces = torch.tensor(self.op_rec_f[idx]).unsqueeze(0).float()
-            normals = torch.tensor(np.repeat(self.op_n_mean[idx].reshape(-1, 3), verts.shape[1], axis=0)).unsqueeze(0).float()
+            verts_np = None
+            faces_np = None
+            if idx < len(target_rec_v) and idx < len(target_rec_f):
+                vv = np.asarray(target_rec_v[idx], dtype=np.float64)
+                ff = np.asarray(target_rec_f[idx], dtype=np.int64)
+                if vv.ndim == 2 and vv.shape[0] >= 3 and ff.ndim == 2 and ff.shape[0] >= 1:
+                    verts_np = vv
+                    faces_np = ff
+            if verts_np is None:
+                verts_np = np.asarray(self.op_rec_v[idx], dtype=np.float64)
+                faces_np = np.asarray(self.op_rec_f[idx], dtype=np.int64)
+            verts = torch.tensor(verts_np).unsqueeze(0).float()
+            faces = torch.tensor(faces_np).unsqueeze(0).long()
+            normal_ref = None
+            if idx < len(target_plane_normal):
+                normal_ref = np.asarray(target_plane_normal[idx], dtype=np.float64).reshape(-1)
+            if normal_ref is None or normal_ref.size != 3:
+                normal_ref = np.asarray(self.op_n_mean[idx], dtype=np.float64).reshape(-1)
+            normals = torch.tensor(np.repeat(normal_ref.reshape(-1, 3), verts.shape[1], axis=0)).unsqueeze(0).float()
             opening_Meshes.append(Meshes(verts=verts, faces=faces, verts_normals=normals if register_normal else None))
         return opening_Meshes
+
+    def return_opening_rim_pointclouds_static(self, prefer_source=True) -> list:
+        rims = []
+        target_rims = getattr(self, "op_target_rim_v", [])
+        for idx in range(self.num_op):
+            rim_np = None
+            if prefer_source and idx < len(target_rims):
+                vv = np.asarray(target_rims[idx], dtype=np.float64)
+                if vv.ndim == 2 and vv.shape[0] >= 3 and vv.shape[1] == 3:
+                    rim_np = vv
+            if rim_np is None and idx < len(self.op_v_coords):
+                vv = np.asarray(self.op_v_coords[idx], dtype=np.float64)
+                if vv.ndim == 2 and vv.shape[0] >= 3 and vv.shape[1] == 3:
+                    rim_np = vv
+            if rim_np is None:
+                rim_np = np.asarray(self.op_rec_v[idx], dtype=np.float64)
+            rims.append(torch.tensor(rim_np).unsqueeze(0).float())
+        return rims
+
+    def return_opening_planes_static(self, prefer_source=True) -> list:
+        planes = []
+        target_centers = getattr(self, "op_target_plane_center", [])
+        target_normals = getattr(self, "op_target_plane_normal", [])
+        for idx in range(self.num_op):
+            center = None
+            normal = None
+            if prefer_source and idx < len(target_centers) and idx < len(target_normals):
+                cc = np.asarray(target_centers[idx], dtype=np.float64).reshape(-1)
+                nn = np.asarray(target_normals[idx], dtype=np.float64).reshape(-1)
+                if cc.size == 3 and nn.size == 3:
+                    center = torch.tensor(cc).float()
+                    normal = torch.tensor(nn).float()
+            if center is None or normal is None:
+                coords = np.asarray(self.op_v_coords[idx], dtype=np.float64)
+                center = torch.tensor(coords.mean(axis=0)).float()
+                normal = torch.tensor(np.asarray(self.op_n_mean[idx], dtype=np.float64)).float()
+            planes.append((center, normal))
+        return planes
 
     def class_normalize(self, norm=10.0):
         # normalize mesh to have max radius of norm
@@ -2690,15 +2791,158 @@ class RegistrationwOpeningAlignment(object):
         for i in range(len(self.op_v_coords)):
             self.op_v_coords[i] /= norm
             self.op_rec_v[i] /= norm
+        if hasattr(self, "op_target_rim_v") and isinstance(self.op_target_rim_v, list):
+            for i in range(len(self.op_target_rim_v)):
+                self.op_target_rim_v[i] = np.asarray(self.op_target_rim_v[i]) / norm
+        if hasattr(self, "op_target_rec_v") and isinstance(self.op_target_rec_v, list):
+            for i in range(len(self.op_target_rec_v)):
+                self.op_target_rec_v[i] = np.asarray(self.op_target_rec_v[i]) / norm
+        if hasattr(self, "op_source_surface_v") and isinstance(self.op_source_surface_v, list):
+            for i in range(len(self.op_source_surface_v)):
+                self.op_source_surface_v[i] = np.asarray(self.op_source_surface_v[i]) / norm
         if hasattr(self, "op_cut_points") and isinstance(self.op_cut_points, list):
             for i in range(len(self.op_cut_points)):
                 self.op_cut_points[i] = np.asarray(self.op_cut_points[i]) / norm
+        if hasattr(self, "op_target_plane_center") and isinstance(self.op_target_plane_center, list):
+            for i in range(len(self.op_target_plane_center)):
+                self.op_target_plane_center[i] = np.asarray(self.op_target_plane_center[i]) / norm
+        if hasattr(self, "centreline_pcd") and self.centreline_pcd is not None:
+            if torch.is_tensor(self.centreline_pcd):
+                self.centreline_pcd = self.centreline_pcd / float(norm)
+            else:
+                self.centreline_pcd = np.asarray(self.centreline_pcd) / float(norm)
         self._mesh_graph_cache = None
         return None
 
+    @staticmethod
+    def _normalize_np_vec(vec):
+        vec = np.asarray(vec, dtype=np.float64).reshape(-1)
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1e-12:
+            return None
+        return vec / norm
+
+    def _compute_opening_cap_normal(self, idx):
+        if idx >= len(self.op_rec_v) or idx >= len(self.op_rec_f):
+            return None
+        verts = np.asarray(self.op_rec_v[idx], dtype=np.float64)
+        faces = np.asarray(self.op_rec_f[idx], dtype=np.int64)
+        if verts.ndim != 2 or verts.shape[0] < 3 or faces.ndim != 2 or faces.shape[0] == 0:
+            return None
+        tri = verts[faces]
+        face_normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        face_normals = face_normals[np.linalg.norm(face_normals, axis=1) > 1e-12]
+        if face_normals.shape[0] == 0:
+            return None
+        return self._normalize_np_vec(face_normals.mean(axis=0))
+
+    def _opening_reference_normal(self, idx, clean_threshold=0.2):
+        mesh_verts = np.asarray(self.mesh_target.vertices, dtype=np.float64)
+        mesh_center = mesh_verts.mean(axis=0) if mesh_verts.shape[0] > 0 else np.zeros(3, dtype=np.float64)
+
+        opening_coords = None
+        if idx < len(self.op_v_coords):
+            opening_coords = np.asarray(self.op_v_coords[idx], dtype=np.float64)
+        elif idx < len(self.op_rec_v):
+            opening_coords = np.asarray(self.op_rec_v[idx], dtype=np.float64)
+        if opening_coords is None or opening_coords.ndim != 2 or opening_coords.shape[0] == 0:
+            return None
+
+        centroid = opening_coords.mean(axis=0)
+        radial = self._normalize_np_vec(centroid - mesh_center)
+
+        if len(self.mesh_target.vertex_normals) == 0:
+            self.mesh_target.compute_vertex_normals()
+        mesh_normals = np.asarray(self.mesh_target.vertex_normals, dtype=np.float64)
+        surface_normal = None
+        if idx < len(self.op_v_indices) and mesh_normals.shape[0] > 0:
+            indices = np.asarray(self.op_v_indices[idx], dtype=np.int64).reshape(-1)
+            valid = indices[(indices >= 0) & (indices < mesh_normals.shape[0])]
+            if valid.size > 0:
+                surface_normal = self._normalize_np_vec(mesh_normals[valid].mean(axis=0))
+
+        if radial is None:
+            return surface_normal
+        if surface_normal is None:
+            return radial
+
+        if float(np.dot(surface_normal, radial)) < -abs(float(clean_threshold)):
+            return radial
+        return radial if abs(float(np.dot(surface_normal, radial))) < abs(float(clean_threshold)) else surface_normal
+
+    def _flip_opening_orientation(self, idx):
+        if idx < len(self.op_v_normal):
+            self.op_v_normal[idx] = -1.0 * np.asarray(self.op_v_normal[idx], dtype=np.float64)
+        if idx < len(self.op_n_mean):
+            self.op_n_mean[idx] = -1.0 * np.asarray(self.op_n_mean[idx], dtype=np.float64)
+        if idx < len(self.op_rec_f):
+            faces = np.asarray(self.op_rec_f[idx], dtype=np.int64)
+            if faces.ndim == 2 and faces.shape[1] == 3:
+                self.op_rec_f[idx] = faces[:, [0, 2, 1]]
+        if idx < len(self.op_rec_f_map):
+            faces_map = np.asarray(self.op_rec_f_map[idx], dtype=np.int64)
+            if faces_map.ndim == 2 and faces_map.shape[1] == 3:
+                self.op_rec_f_map[idx] = faces_map[:, [0, 2, 1]]
+
+    def _rebuild_centreline_pcd_from_wave_loops(self):
+        if not hasattr(self, "wave_loops") or self.wave_loops is None:
+            return
+        verts = np.asarray(self.mesh_target.vertices, dtype=np.float64)
+        points = []
+        for branch in self.wave_loops:
+            for loop in branch:
+                loop_idx = np.asarray(loop, dtype=np.int64).reshape(-1)
+                valid = loop_idx[(loop_idx >= 0) & (loop_idx < verts.shape[0])]
+                if valid.size == 0:
+                    continue
+                points.append(verts[valid].mean(axis=0))
+        if not points:
+            return
+        centreline_np = np.asarray(points, dtype=np.float32)
+        if hasattr(self, "centreline_pcd") and torch.is_tensor(self.centreline_pcd):
+            self.centreline_pcd = torch.from_numpy(centreline_np)
+        else:
+            self.centreline_pcd = centreline_np
+
     def centreline_clean(self, radius=0.0):
-        # clean centreline points that are too close to each other
-        # this is not implemented yet
+        if not hasattr(self, "wave_loops") or self.wave_loops is None:
+            return None
+        verts = np.asarray(self.mesh_target.vertices, dtype=np.float64)
+        if verts.shape[0] == 0:
+            return None
+
+        clean_radius = float(radius)
+        if clean_radius <= 0.0:
+            clean_radius = 0.5 * float(self._get_mesh_graph_cache()["median_edge_length"])
+        cleaned_wave_loops = []
+        for branch in self.wave_loops:
+            cleaned_branch = []
+            previous_centroid = None
+            for loop in branch:
+                loop_idx = np.asarray(loop, dtype=np.int64).reshape(-1)
+                loop_idx = loop_idx[(loop_idx >= 0) & (loop_idx < verts.shape[0])]
+                loop_idx = np.unique(loop_idx)
+                if loop_idx.size == 0:
+                    continue
+                centroid = verts[loop_idx].mean(axis=0)
+                if previous_centroid is None or np.linalg.norm(centroid - previous_centroid) >= clean_radius:
+                    cleaned_branch.append(loop_idx.tolist())
+                    previous_centroid = centroid
+                    continue
+                if len(cleaned_branch[-1]) < loop_idx.size:
+                    cleaned_branch[-1] = loop_idx.tolist()
+                    previous_centroid = centroid
+            if not cleaned_branch:
+                for loop in branch:
+                    loop_idx = np.asarray(loop, dtype=np.int64).reshape(-1)
+                    loop_idx = loop_idx[(loop_idx >= 0) & (loop_idx < verts.shape[0])]
+                    loop_idx = np.unique(loop_idx)
+                    if loop_idx.size > 0:
+                        cleaned_branch.append(loop_idx.tolist())
+                        break
+            cleaned_wave_loops.append(cleaned_branch)
+        self.wave_loops = cleaned_wave_loops
+        self._rebuild_centreline_pcd_from_wave_loops()
         return None
 
     def visualize_centreline(self, norm_target):
@@ -2707,8 +2951,39 @@ class RegistrationwOpeningAlignment(object):
         return None
     
     def sort_opening_normals(self, inspect_true_normal=False, clean_threshold=0.2, bold=False):
-        # this is a placeholder for normal sorting logic
-        # Since we don't have the original logic, we will assume normals are correct or try to orient them outwards
+        if len(self.op_n_mean) == 0:
+            return None
+        clean_threshold = float(clean_threshold)
+        for idx in range(len(self.op_n_mean)):
+            reference_normal = self._opening_reference_normal(idx, clean_threshold=clean_threshold)
+            current_normal = self._normalize_np_vec(self.op_n_mean[idx])
+            cap_normal = self._compute_opening_cap_normal(idx)
+
+            if reference_normal is None:
+                reference_normal = cap_normal
+            if reference_normal is None:
+                reference_normal = current_normal
+            if reference_normal is None:
+                continue
+
+            need_flip = False
+            if current_normal is not None and float(np.dot(current_normal, reference_normal)) < 0.0:
+                need_flip = True
+            if not need_flip and cap_normal is not None and float(np.dot(cap_normal, reference_normal)) < 0.0:
+                need_flip = True
+            if bold and current_normal is not None and float(np.dot(current_normal, reference_normal)) < clean_threshold:
+                need_flip = True
+            if need_flip:
+                self._flip_opening_orientation(idx)
+                current_normal = self._normalize_np_vec(self.op_n_mean[idx])
+
+            if current_normal is None:
+                self.op_n_mean[idx] = np.asarray(reference_normal, dtype=np.float64)
+            if inspect_true_normal:
+                print(
+                    f"[sort_opening_normals] opening={idx} "
+                    f"dot={float(np.dot(self._normalize_np_vec(self.op_n_mean[idx]), reference_normal)):.4f}"
+                )
         return None
 
 

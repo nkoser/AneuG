@@ -22,9 +22,18 @@ def faces_angle(meshs: Meshes) -> torch.Tensor:
     A = Face_coord[:, 1, :] - Face_coord[:, 0, :]
     B = Face_coord[:, 2, :] - Face_coord[:, 1, :]
     C = Face_coord[:, 0, :] - Face_coord[:, 2, :]
-    angle_0 = torch.arccos(-torch.sum(A * C, dim=1) / (1e-10 + (torch.norm(A, dim=1) * torch.norm(C, dim=1))))
-    angle_1 = torch.arccos(-torch.sum(A * B, dim=1) / (1e-10 + (torch.norm(A, dim=1) * torch.norm(B, dim=1))))
-    angle_2 = torch.arccos(-torch.sum(B * C, dim=1) / (1e-10 + (torch.norm(B, dim=1) * torch.norm(C, dim=1))))
+    eps = 1e-8
+
+    def _safe_angle(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        denom = torch.clamp(torch.norm(u, dim=1) * torch.norm(v, dim=1), min=eps)
+        cosine = -torch.sum(u * v, dim=1) / denom
+        cosine = torch.nan_to_num(cosine, nan=1.0, posinf=1.0, neginf=-1.0)
+        cosine = torch.clamp(cosine, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        return torch.arccos(cosine)
+
+    angle_0 = _safe_angle(A, C)
+    angle_1 = _safe_angle(A, B)
+    angle_2 = _safe_angle(B, C)
     angles = torch.stack([angle_0, angle_1, angle_2], dim=1)
     return angles
 
@@ -38,9 +47,23 @@ def dual_area_weights_faces(Surfaces: Meshes) -> torch.Tensor:
         the dual area of a vertices in a triangles is defined as the area of the sub-quadrilateral divided by three perpendicular bisectors
     """
     angles = faces_angle(Surfaces)
-    sin2angle = torch.sin(2 * angles)
-    dual_area_weight = sin2angle / (torch.sum(sin2angle, dim=-1, keepdim=True) + 1e-8)
+    sin2angle = torch.nan_to_num(torch.sin(2 * angles), nan=0.0, posinf=0.0, neginf=0.0)
+    denom = torch.sum(sin2angle, dim=-1, keepdim=True)
+    valid = torch.abs(denom) > 1e-8
+    safe_denom = torch.where(valid, denom, torch.ones_like(denom))
+    dual_area_weight = sin2angle / safe_denom
+    dual_area_weight = torch.where(
+        valid.expand_as(dual_area_weight),
+        dual_area_weight,
+        torch.full_like(dual_area_weight, 1.0 / 3.0),
+    )
     dual_area_weight = (dual_area_weight[:, [2, 0, 1]] + dual_area_weight[:, [1, 2, 0]]) / 2
+    dual_area_weight = torch.nan_to_num(
+        dual_area_weight,
+        nan=1.0 / 3.0,
+        posinf=1.0 / 3.0,
+        neginf=1.0 / 3.0,
+    )
     return dual_area_weight
 
 def dual_area_vertex(Surfaces: Meshes) -> torch.Tensor:
@@ -54,8 +77,10 @@ def dual_area_vertex(Surfaces: Meshes) -> torch.Tensor:
     """
     dual_weights = dual_area_weights_faces(Surfaces)
     dual_areas = dual_weights * Surfaces.faces_areas_packed().view(-1, 1)
+    dual_areas = torch.nan_to_num(dual_areas, nan=0.0, posinf=0.0, neginf=0.0)
     face2vertex_index = Surfaces.faces_packed().view(-1)
     dual_area_per_vertex = scatter(dual_areas.view(-1), face2vertex_index, reduce='sum')
+    dual_area_per_vertex = torch.nan_to_num(dual_area_per_vertex, nan=0.0, posinf=0.0, neginf=0.0)
     return dual_area_per_vertex.view(-1, 1)
 
 def gaussian_curvature(Surfaces: Meshes, return_topology=False) -> torch.Tensor:
@@ -114,10 +139,13 @@ def Winding_Occupancy(mesh_tem: Meshes, points: torch.Tensor):
     mesh_tem: the reference mesh
     points: the points to be evaluated Nx3
     """
-    dual_areas = dual_area_vertex(mesh_tem)
+    dual_areas = torch.nan_to_num(dual_area_vertex(mesh_tem), nan=0.0, posinf=0.0, neginf=0.0)
     normals_areaic = mesh_tem.verts_normals_packed() * dual_areas.view(-1, 1)
+    normals_areaic = torch.nan_to_num(normals_areaic, nan=0.0, posinf=0.0, neginf=0.0)
     face_elefields_temp = Electric_strength(points, mesh_tem.verts_packed())
+    face_elefields_temp = torch.nan_to_num(face_elefields_temp, nan=0.0, posinf=0.0, neginf=0.0)
     winding_field = einsum(face_elefields_temp, normals_areaic, 'm n c, n c -> m') / 4 / np.pi
+    winding_field = torch.nan_to_num(winding_field, nan=0.0, posinf=1.0, neginf=-1.0)
     return winding_field
 
 class Differentiable_Voxelizer(nn.Module):

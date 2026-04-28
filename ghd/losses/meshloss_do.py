@@ -35,12 +35,112 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         self.do_module = None  # upsampling module if using uniform
         self.do_loss_type = getattr(args, "do_loss_type", "dice_loss")
         self.do_number = getattr(args, "do_number", 10000)
+        self.redo_do_points = bool(int(getattr(args, "redo_do_points", 0)))
+        self.do_sampling_max_loops = max(8, int(getattr(args, "do_sampling_max_loops", 128)))
         self.root_target = args.root_target
         self.name_target = args.name_target
         self.weights_attention = None
         self.opening_match_mode = str(getattr(args, "opening_match_mode", "permutation")).strip().lower()
         self.opening_normal_bidirectional = bool(int(getattr(args, "opening_normal_bidirectional", 1)))
+        self.opening_loss_mode = str(getattr(args, "opening_loss_mode", "surface")).strip().lower()
+        self.preview_opening_points_warped = []
+        self.preview_opening_points_target = []
+        self.preview_opening_normal_points_warped = []
+        self.preview_opening_normals_warped = []
+        self.preview_opening_normal_points_target = []
+        self.preview_opening_normals_target = []
+        if hasattr(oa_class_target, "return_opening_rim_pointclouds_static"):
+            self.target_opening_rims = oa_class_target.return_opening_rim_pointclouds_static(prefer_source=True)
+        else:
+            self.target_opening_rims = [opening.verts_padded().detach().cpu() for opening in self.target_openings]
+        if hasattr(oa_class_target, "return_opening_planes_static"):
+            self.target_opening_planes = oa_class_target.return_opening_planes_static(prefer_source=True)
+        else:
+            self.target_opening_planes = []
+            for opening in self.target_openings:
+                centroid, normal = self._plane_from_points(opening.verts_packed().to(self.device))
+                self.target_opening_planes.append((centroid, normal))
+
+        # ------------------------------------------------------------------
+        # Build *decapped* face masks so that loss_p0 (global surface
+        # chamfer) does not sample from cap triangles.  Cap samples create
+        # conflicting gradients: the chamfer pulls them toward the dome
+        # surface while the opening-specific losses want them planar.
+        # ------------------------------------------------------------------
+        self._decap_enabled = bool(int(getattr(args, "decap_chamfer", 1)))
+        self._canon_cap_face_mask = None   # bool [F] – True = keep
+        self._target_cap_face_mask = None
+        self._target_mesh_decapped = None
+        if self._decap_enabled:
+            self._canon_cap_face_mask = self._build_decap_mask(
+                base_shape, oa_class_canonical)
+            self._target_cap_face_mask = self._build_decap_mask(
+                self.target_mesh, oa_class_target)
+            if self._target_cap_face_mask is not None:
+                tgt_faces = self.target_mesh.faces_packed()
+                tgt_verts = self.target_mesh.verts_padded()
+                kept = tgt_faces[self._target_cap_face_mask]
+                self._target_mesh_decapped = Meshes(
+                    verts=tgt_verts, faces=kept.unsqueeze(0)
+                ).to(self.device)
+                n_removed = int((~self._target_cap_face_mask).sum())
+                print(f"[Decap] Target: removed {n_removed} cap faces from chamfer sampling")
+
         super(Mesh_loss_differentiable_occupancy, self).__init__(mesh_std=base_shape, sample_num=self.sample_num)
+
+    @staticmethod
+    def _build_decap_mask(mesh: Meshes, oa_class) -> torch.Tensor:
+        """Return a boolean mask [F] that is True for non-cap faces.
+
+        Cap faces are identified as faces whose **all three** vertices
+        belong to the set of opening rim vertex indices.  This is robust
+        regardless of how the face map is stored internally.
+        """
+        op_v_indices = getattr(oa_class, "op_v_indices", [])
+        if not op_v_indices:
+            return None
+        # Collect all opening rim vertex indices across all openings
+        rim_verts = set()
+        for vlist in op_v_indices:
+            for vi in vlist:
+                rim_verts.add(int(vi))
+        if not rim_verts:
+            return None
+        faces = mesh.faces_packed().cpu().numpy()  # (F, 3)
+        n_faces = faces.shape[0]
+        mask = np.ones(n_faces, dtype=bool)
+        for fi in range(n_faces):
+            if int(faces[fi, 0]) in rim_verts and \
+               int(faces[fi, 1]) in rim_verts and \
+               int(faces[fi, 2]) in rim_verts:
+                mask[fi] = False
+        n_removed = int((~mask).sum())
+        if n_removed == 0:
+            return None
+        return torch.from_numpy(mask)
+
+    def _decapped_warped_mesh(self, warped_mesh: Meshes) -> Meshes:
+        """Build a decapped version of the warped mesh using the canonical cap mask."""
+        if self._canon_cap_face_mask is None:
+            return warped_mesh
+        faces = warped_mesh.faces_packed()
+        verts = warped_mesh.verts_padded()
+        kept = faces[self._canon_cap_face_mask.to(faces.device)]
+        return Meshes(verts=verts, faces=kept.unsqueeze(0))
+
+    def _target_occupancy_prob(self, query_points, device, warned_nonfinite=False):
+        winding_val = Winding_Occupancy(self.target_mesh.to(device), query_points)
+        finite_mask = torch.isfinite(winding_val)
+        if (not warned_nonfinite) and (not bool(finite_mask.all())):
+            invalid = int((~finite_mask).sum().item())
+            print(
+                f"[DO] Non-finite winding values for {self.name_target}: "
+                f"{invalid}/{int(winding_val.numel())}. Replacing invalid values before thresholding."
+            )
+            warned_nonfinite = True
+        winding_val = torch.nan_to_num(winding_val, nan=0.0, posinf=1.0, neginf=-1.0)
+        do_gt = torch.sigmoid((winding_val.abs() - 0.5) * 100)
+        return do_gt, warned_nonfinite
 
     def _solve_opening_assignment(self, warped_openings):
         num_pairs = min(len(warped_openings), len(self.target_openings))
@@ -50,16 +150,20 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         warped_points = []
         target_points = []
         for i in range(num_pairs):
-            warped_points.append(
-                self._safe_sample_points_from_meshes(
-                    warped_openings[i], self.op_sample_num, return_normals=False
+            if self._opening_mode_uses_boundary(self.opening_loss_mode):
+                warped_points.append(self._sample_opening_boundary_points(warped_openings[i], self.op_sample_num))
+                target_points.append(self._sample_point_cloud(self.target_opening_rims[i], self.op_sample_num))
+            else:
+                warped_points.append(
+                    self._safe_sample_points_from_meshes(
+                        warped_openings[i], self.op_sample_num, return_normals=False
+                    )
                 )
-            )
-            target_points.append(
-                self._safe_sample_points_from_meshes(
-                    self.target_openings[i].to(self.device), self.op_sample_num, return_normals=False
+                target_points.append(
+                    self._safe_sample_points_from_meshes(
+                        self.target_openings[i].to(self.device), self.op_sample_num, return_normals=False
+                    )
                 )
-            )
 
         cost = np.zeros((num_pairs, num_pairs), dtype=np.float64)
         for i in range(num_pairs):
@@ -177,14 +281,18 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
             y = np.random.uniform(bound_box[1, 0], bound_box[1, 1], size=batch_size)
             z = np.random.uniform(bound_box[2, 0], bound_box[2, 1], size=batch_size)
             query_points = torch.tensor(np.stack([x, y, z], axis=1)).float()
-            do_gt = torch.sigmoid((Winding_Occupancy(self.target_mesh.to(device), query_points) - 0.5) * 100)
+            do_gt, _ = self._target_occupancy_prob(query_points, device)
             indices_in = torch.where(do_gt > 0.95)[0]
             indices_out = torch.where(do_gt < 0.05)[0]
             count_num_in += indices_in.shape[0]
             count_num_out += indices_out.shape[0]
             query_points_in.append(query_points[indices_in, :].numpy())
             query_points_out.append(query_points[indices_out, :].numpy())
-            print("{} and {} points have been founded for static dc registration.\n".format(count_num_in, count_num_out))
+            if batch < 3 or batch == 19 or (batch + 1) % 5 == 0:
+                print(
+                    f"[DO] static sampling {batch + 1}/20: "
+                    f"found {count_num_in} inside and {count_num_out} outside points."
+                )
             if count_num_in >= num_in and count_num_out >= num_out:
                 break
         query_points_in = torch.Tensor(np.concatenate(query_points_in, axis=0))[:num_in, :]
@@ -193,7 +301,7 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         do_gt = torch.cat((torch.ones(num_in), torch.zeros(num_out)), dim=0)
         return query_points, do_gt
 
-    def get_static_mask_number_control_v2(self, num_in=10000, num_out=10000, expand_ratio=5, smooth=0.02, inspect=False, redo=True):
+    def get_static_mask_number_control_v2(self, num_in=10000, num_out=10000, expand_ratio=5, smooth=0.02, inspect=False, redo=False):
         """
         :param num_in: point number inside the shape
         :param num_out:
@@ -217,22 +325,52 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         query_points_in = []
         query_points_out = []
         points_path = os.path.join(self.root_target, self.name_target, "do_points.pt")
-        if not os.path.exists(points_path) or redo:
+        need_regen = bool((not os.path.exists(points_path)) or redo)
+        if not need_regen:
+            try:
+                print("do points successfully loaded!")
+                dict_pt = torch.load(points_path, map_location="cpu")
+                query_points_in = dict_pt['query_points_in']
+                query_points_out = dict_pt['query_points_out']
+                if not torch.is_tensor(query_points_in):
+                    query_points_in = torch.as_tensor(query_points_in).float()
+                if not torch.is_tensor(query_points_out):
+                    query_points_out = torch.as_tensor(query_points_out).float()
+                query_points_in = query_points_in.detach().cpu().float()
+                query_points_out = query_points_out.detach().cpu().float()
+                if query_points_in.ndim != 2 or query_points_in.shape[1] != 3:
+                    raise ValueError("query_points_in has invalid shape")
+                if query_points_out.ndim != 2 or query_points_out.shape[1] != 3:
+                    raise ValueError("query_points_out has invalid shape")
+                if query_points_in.shape[0] < num_in:
+                    raise ValueError("query_points_in has too few points")
+                if query_points_out.shape[0] < num_out:
+                    raise ValueError("query_points_out has too few points")
+                if not torch.isfinite(query_points_in).all():
+                    raise ValueError("query_points_in contains non-finite values")
+                if not torch.isfinite(query_points_out).all():
+                    raise ValueError("query_points_out contains non-finite values")
+            except Exception as e:
+                print(f"do_points load failed, redoing points searching: {type(e).__name__}: {e}")
+                need_regen = True
+        if need_regen:
             print("do_points no found, redoing points searching")
             query_points_in = torch.empty((0, 3)).float()
             query_points_out = torch.empty((0, 3)).float()
             loop_idx = 0
-            while True:
+            warned_nonfinite = False
+            while loop_idx < self.do_sampling_max_loops:
                 loop_idx += 1
                 x = np.random.uniform(bound_box[0, 0], bound_box[0, 1], size=batch_size)
                 y = np.random.uniform(bound_box[1, 0], bound_box[1, 1], size=batch_size)
                 z = np.random.uniform(bound_box[2, 0], bound_box[2, 1], size=batch_size)
                 query_points = torch.tensor(np.stack([x, y, z], axis=1)).float()
-                
-                # Checking winding number magnitude to handle inverted normals
-                winding_val = Winding_Occupancy(self.target_mesh.to(device), query_points)
-                # Using .abs() because some meshes might have inverted normals (winding ~ -1)
-                do_gt = torch.sigmoid((winding_val.abs() - 0.5) * 100)
+
+                do_gt, warned_nonfinite = self._target_occupancy_prob(
+                    query_points,
+                    device,
+                    warned_nonfinite=warned_nonfinite,
+                )
                 indices_in = torch.where(do_gt > 0.95)[0]
                 indices_out = torch.where(do_gt < 0.05)[0]
                 if count_num_in <= expand_ratio * num_in:
@@ -243,17 +381,25 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
                     count_num_out += indices_out.shape[0]
                     query_points_out = torch.cat((query_points_out, query_points[indices_out, :]), dim=0)
 
-                print("{} and {} points have been founded for static dc registration.\n".format(count_num_in, count_num_out))
+                if loop_idx <= 3 or loop_idx == self.do_sampling_max_loops or loop_idx % 10 == 0:
+                    print(
+                        f"[DO] static sampling {loop_idx}/{self.do_sampling_max_loops}: "
+                        f"found {count_num_in} inside and {count_num_out} outside points."
+                    )
                 if count_num_in >= expand_ratio * num_in and count_num_out >= expand_ratio * num_out:
                     break
+            if count_num_in < expand_ratio * num_in or count_num_out < expand_ratio * num_out:
+                raise RuntimeError(
+                    "Static DO point sampling did not converge for "
+                    f"{self.name_target} after {self.do_sampling_max_loops} loops "
+                    f"(inside={count_num_in}, outside={count_num_out}, "
+                    f"required_inside={expand_ratio * num_in}, required_outside={expand_ratio * num_out}). "
+                    "This usually indicates invalid winding/mesh geometry or an unusable cached target mesh."
+                )
             # calculate field strength
             query_points_in = query_points_in[: expand_ratio * num_in, :]
             query_points_out = query_points_out[: expand_ratio * num_out, :]
             torch.save({'query_points_in': query_points_in, 'query_points_out': query_points_out}, points_path)
-        else:
-            print("do points successfully loaded!")
-            dict_pt = torch.load(points_path)
-            query_points_in, query_points_out = dict_pt['query_points_in'], dict_pt['query_points_out']
         # dict_pt = torch.load('points.pt')
         # query_points_in, query_points_out = dict_pt['query_points_in'], dict_pt['query_points_out0']
         source_verts = torch.cat((self.mesh_std.verts_packed().detach().cpu().float(),
@@ -308,16 +454,16 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
             # query_points_upsample = query_points.permute((3, 0, 1, 2)).unsqueeze(0)
             # self.do_module = torch.nn.Upsample(scale_factor=2, mode='trilinear')
             # query_points_upsample = self.do_module(query_points_upsample)
-            do_gt = torch.sigmoid((Winding_Occupancy(self.target_mesh.to(device), query_points) - 0.5) * 100)
+            do_gt, _ = self._target_occupancy_prob(query_points, device)
             query_points = query_points.view(-1, 3)
         elif style == 'number_control':
             query_points, do_gt = self.get_static_mask_number_control(num_in=self.do_number, num_out=self.do_number)
         elif style == 'number_control_v2':
             query_points, do_gt = self.get_static_mask_number_control_v2(num_in=self.do_number, num_out=self.do_number,
-                                                                         expand_ratio=2, smooth=0.02, redo=True)
+                                                                         expand_ratio=2, smooth=0.02, redo=self.redo_do_points)
         else:
             query_points = self.get_static_mask_probabilistic()
-            do_gt = torch.sigmoid((Winding_Occupancy(self.target_mesh.to(device), query_points) - 0.5) * 100)
+            do_gt, _ = self._target_occupancy_prob(query_points, device)
 
         self.do_style = style
 
@@ -355,34 +501,143 @@ class Mesh_loss_differentiable_occupancy(Mesh_loss):
         print('field strength assigned')
 
     def forward_opa_do(self, warped_mesh, warped_openings, loss_weighting: dict, query_points, do_gt, do_index, B=1):
-        # TODO: write a switch so children classes can skip opa losses
-        loss_dict = self.forward(meshes_scr=warped_mesh, trg=self.target_mesh, loss_list=loss_weighting, B=B)
+        # Use decapped meshes for loss_p0 / loss_n1 to avoid cap-surface
+        # samples pulling cap vertices toward the dome.  Regularisation
+        # losses (laplacian, edge, consistency, rigid) still use the full
+        # mesh so that cap triangles stay well-conditioned.
+        if self._decap_enabled and self._canon_cap_face_mask is not None:
+            warped_decap = self._decapped_warped_mesh(warped_mesh)
+            target_decap = self._target_mesh_decapped if self._target_mesh_decapped is not None else self.target_mesh
+            # Compute surface chamfer on decapped meshes
+            loss_dict_surface = self.forward(
+                meshes_scr=warped_decap, trg=target_decap,
+                loss_list={k: v for k, v in loss_weighting.items() if k in ('loss_p0', 'loss_n1')},
+                B=B,
+            )
+            # Compute regularisation on full mesh
+            reg_keys = {k for k in loss_weighting if k not in ('loss_p0', 'loss_n1')}
+            loss_dict_reg = self.forward(
+                meshes_scr=warped_mesh, trg=self.target_mesh,
+                loss_list={k: v for k, v in loss_weighting.items() if k in reg_keys},
+                B=B,
+            )
+            loss_dict = {**loss_dict_surface, **loss_dict_reg}
+        else:
+            loss_dict = self.forward(meshes_scr=warped_mesh, trg=self.target_mesh, loss_list=loss_weighting, B=B)
         loss_p_list = []
+        loss_surface_p_list = []
         loss_n_list = []
-        if ('loss_openings_p' in loss_weighting) or ('loss_openings_n' in loss_weighting):
+        loss_plane_list = []
+        self.preview_opening_points_warped = []
+        self.preview_opening_points_target = []
+        self.preview_opening_normal_points_warped = []
+        self.preview_opening_normals_warped = []
+        self.preview_opening_normal_points_target = []
+        self.preview_opening_normals_target = []
+        if any(k in loss_weighting for k in ('loss_openings_p', 'loss_openings_n', 'loss_openings_plane', 'loss_openings_surface_p', 'loss_openings_rim_curvature')):
             num_pairs = min(len(warped_openings), len(self.target_openings))
             assignment = self._solve_opening_assignment(warped_openings)
+            loss_rim_curve_list = []
             for idx in range(num_pairs):
                 trg_idx = int(assignment[idx]) if idx < len(assignment) else idx
-                pcd_wo, nor_wo = self._safe_sample_points_from_meshes(
-                    warped_openings[idx], self.op_sample_num, return_normals=True
-                )
-                pcd_to, nor_to = self._safe_sample_points_from_meshes(
-                    self.target_openings[trg_idx].to(self.device), self.op_sample_num, return_normals=True
-                )
-                loss_p, loss_n = chamfer_distance(pcd_wo, pcd_to, x_normals=nor_wo, y_normals=nor_to)
-                if self.opening_normal_bidirectional:
-                    _, loss_n_flip = chamfer_distance(
-                        pcd_wo, pcd_to, x_normals=nor_wo, y_normals=(-1.0 * nor_to)
+                target_opening = self.target_openings[trg_idx].to(self.device)
+                target_plane = self.target_opening_planes[trg_idx] if trg_idx < len(self.target_opening_planes) else None
+
+                if self._opening_mode_uses_boundary(self.opening_loss_mode):
+                    if self._opening_mode_uses_ordered_rim(self.opening_loss_mode):
+                        ordered_samples = max(64, min(160, int(self.op_sample_num // 12)))
+                        loss_p, pcd_wo, pcd_to = self._opening_ordered_rim_loss(
+                            warped_openings[idx],
+                            self.target_opening_rims[trg_idx],
+                            num_samples=ordered_samples,
+                        )
+                    else:
+                        pcd_wo = self._sample_opening_boundary_points(
+                            warped_openings[idx], self.op_sample_num
+                        )
+                        pcd_to = self._sample_point_cloud(self.target_opening_rims[trg_idx], self.op_sample_num)
+                        loss_p, _ = chamfer_distance(pcd_wo, pcd_to, x_normals=None, y_normals=None)
+
+                    pcd_wo_n = pcd_wo
+                    pcd_to_n = pcd_to
+                    warped_centroid, warped_normal = self._plane_from_points(pcd_wo[0])
+                    target_centroid, target_normal = target_plane if target_plane is not None else (None, None)
+                    if warped_normal is None:
+                        nor_wo = torch.zeros_like(pcd_wo_n)
+                    else:
+                        nor_wo = warped_normal.reshape(1, 1, 3).repeat(1, pcd_wo_n.shape[1], 1)
+                    if target_normal is None:
+                        nor_to = torch.zeros_like(pcd_to_n)
+                    else:
+                        target_normal = target_normal.to(device=self.device, dtype=pcd_to_n.dtype)
+                        nor_to = target_normal.reshape(1, 1, 3).repeat(1, pcd_to_n.shape[1], 1)
+                    loss_n = self._opening_plane_normal_loss(
+                        warped_openings[idx],
+                        target_plane=target_plane,
+                        sign_invariant=self.opening_normal_bidirectional,
                     )
-                    if torch.isfinite(loss_n_flip):
-                        loss_n = torch.minimum(loss_n, loss_n_flip)
+                else:
+                    pcd_wo, nor_wo = self._safe_sample_points_from_meshes(
+                        warped_openings[idx], self.op_sample_num, return_normals=True
+                    )
+                    pcd_to, nor_to = self._safe_sample_points_from_meshes(
+                        target_opening, self.op_sample_num, return_normals=True
+                    )
+                    loss_p, loss_n = chamfer_distance(pcd_wo, pcd_to, x_normals=nor_wo, y_normals=nor_to)
+                    if self.opening_normal_bidirectional:
+                        _, loss_n_flip = chamfer_distance(
+                            pcd_wo, pcd_to, x_normals=nor_wo, y_normals=(-1.0 * nor_to)
+                        )
+                        if torch.isfinite(loss_n_flip):
+                            loss_n = torch.minimum(loss_n, loss_n_flip)
+                if 'loss_openings_surface_p' in loss_weighting:
+                    pcd_wo_surface = self._safe_sample_points_from_meshes(
+                        warped_openings[idx], self.op_sample_num, return_normals=False
+                    )
+                    pcd_to_surface = self._safe_sample_points_from_meshes(
+                        target_opening, self.op_sample_num, return_normals=False
+                    )
+                    loss_surface_p, _ = chamfer_distance(
+                        pcd_wo_surface,
+                        pcd_to_surface,
+                        x_normals=None,
+                        y_normals=None,
+                    )
+                    loss_surface_p_list.append(
+                        loss_surface_p if torch.isfinite(loss_surface_p) else torch.tensor(0.0, device=self.device)
+                    )
+                self.preview_opening_points_warped.append(pcd_wo.detach().cpu())
+                self.preview_opening_points_target.append(pcd_to.detach().cpu())
+                self.preview_opening_normal_points_warped.append(pcd_wo_n.detach().cpu())
+                self.preview_opening_normals_warped.append(nor_wo.detach().cpu())
+                self.preview_opening_normal_points_target.append(pcd_to_n.detach().cpu())
+                self.preview_opening_normals_target.append(nor_to.detach().cpu())
+                if 'loss_openings_plane' in loss_weighting:
+                    loss_plane = self._opening_planarity_loss(warped_openings[idx], target_plane=target_plane)
+                    loss_plane_list.append(
+                        loss_plane if torch.isfinite(loss_plane) else torch.tensor(0.0, device=self.device)
+                    )
+                if 'loss_openings_rim_curvature' in loss_weighting:
+                    loss_rim_curve = self._opening_rim_curvature_loss(
+                        warped_openings[idx],
+                        self.target_opening_rims[trg_idx],
+                        num_samples=max(48, min(128, int(self.op_sample_num // 16))),
+                    )
+                    loss_rim_curve_list.append(
+                        loss_rim_curve if torch.isfinite(loss_rim_curve) else torch.tensor(0.0, device=self.device)
+                    )
                 loss_p_list.append(loss_p if torch.isfinite(loss_p) else torch.Tensor([0.0]).to(self.device))
                 loss_n_list.append(loss_n if torch.isfinite(loss_n) else torch.Tensor([0.0]).to(self.device))
             if 'loss_openings_p' in loss_weighting:
                 loss_dict['loss_openings_p'] = loss_p_list
+            if 'loss_openings_surface_p' in loss_weighting and len(loss_surface_p_list) > 0:
+                loss_dict['loss_openings_surface_p'] = torch.mean(torch.stack(loss_surface_p_list))
             if 'loss_openings_n' in loss_weighting:
                 loss_dict['loss_openings_n'] = loss_n_list
+            if 'loss_openings_plane' in loss_weighting and len(loss_plane_list) > 0:
+                loss_dict['loss_openings_plane'] = torch.mean(torch.stack(loss_plane_list))
+            if 'loss_openings_rim_curvature' in loss_weighting and len(loss_rim_curve_list) > 0:
+                loss_dict['loss_openings_rim_curvature'] = torch.mean(torch.stack(loss_rim_curve_list))
         if 'loss_do' in loss_weighting:
             if self.do_style == 'uniform_upsample':
                 winding_field = torch.sigmoid((Winding_Occupancy(warped_mesh, query_points) - 0.5) * 100)

@@ -27,6 +27,8 @@ DEFAULTS = {
     "name_canonical": "canonical_typeB",
     "name_target": "AN213_full_clean",
     "case_glob": "*",
+    "exclude_cases_file": "",
+    "include_cases_file": "",
     "viz_freq": 1000,
     "chk_freq": None,
     "log_freq": 100,
@@ -39,11 +41,24 @@ DEFAULTS = {
     "plateau_threshold": 1e-4,
     "plateau_cooldown": 100,
     "min_lr": 1e-6,
+    "resume_override_hparams": 1,
+    "prefit_guard_enabled": 0,
+    "prefit_opening_p_threshold": 0.14,
+    "prefit_opening_p_severe_threshold": 0.28,
+    "prefit_opening_surface_p_threshold": 0.012,
+    "prefit_opening_surface_p_severe_threshold": 0.03,
+    "prefit_opening_plane_threshold": 0.045,
+    "prefit_opening_plane_severe_threshold": 0.09,
+    "prefit_centreline_threshold": 0.18,
+    "prefit_centreline_severe_threshold": 0.30,
     "early_stopping": 0,
     "early_stopping_patience": 1200,
     "early_stopping_min_delta": 1e-5,
     "early_stopping_min_epochs": 2000,
     "nonfinite_guard": 1,
+    "keep_size": 1,
+    "keep_size_factor": 1.0,
+    "grad_clip_norm": 0.0,
     "num_op": 3,
     "num_Basis": 13 ** 2,
     "mix_lap_weights": [1.0, 0.1, 0.1],
@@ -61,9 +76,19 @@ DEFAULTS = {
     "attention_max_w": 3.0,
     "attention_smooth": 0.02,
     "do_number": 25000,
+    "redo_do_points": 0,
+    "do_sampling_max_loops": 128,
     "weighter_style": "strategy_v1_linear",
+    "opening_warmup_epochs": 0,
+    "opening_start_scale": 1.0,
+    "opening_surface_start_scale": 1.0,
+    "opening_normal_start_scale": 1.0,
+    "opening_plane_start_scale": 1.0,
+    "opening_rim_start_scale": 1.0,
+    "centreline_start_scale": 1.0,
     "opening_match_mode": "permutation",  # permutation | index
     "opening_normal_bidirectional": 1,  # 1: sign-invariant opening normal loss
+    "opening_loss_mode": "surface",  # surface | boundary | rim_plane | rim_ordered
     "mesh_filename": "part_aligned.obj",
     "redo_registration": 0,
     "auto_opening_method": "normals",  # normals | legacy
@@ -77,8 +102,25 @@ DEFAULTS = {
     "render_auto_registration_only": 0,
     "render_auto_registration_overwrite": 0,
     "render_auto_registration_dir": "./checkpoints/auto_registration_qc",
+    "canonical_chk": "",
+    "roundrobin_step": 0,
     "parallel_cases": 1,
     "parallel_devices": "",
+    # --- Decap chamfer: exclude cap faces from loss_p0 (only relevant for capped meshes) ---
+    "decap_chamfer": 0,
+    "decap_chamfer_rings": 0,
+    # --- Local rim vertex refinement (Stage 2) ---
+    "rim_refine_enabled": 0,
+    "rim_refine_epochs": 800,
+    "rim_refine_lr": 0.0006,
+    "rim_refine_rings": 3,
+    "rim_refine_laplacian_weight": 0.15,
+    "rim_refine_edge_weight": 0.10,
+    "rim_refine_opening_p_weight": 14.0,
+    "rim_refine_opening_plane_weight": 10.0,
+    "rim_refine_surface_p_weight": 3.0,
+    "rim_refine_grad_clip_norm": 0.5,
+    "rim_refine_on_suspicious_only": 0,
     "loss_weighting": {
         "loss_do": 1.0,
         "loss_p0": 1.0 * 1,
@@ -124,6 +166,19 @@ def _load_pickle(path: str):
         return pickle.load(f)
 
 
+def _load_case_name_file(path: str) -> List[str]:
+    names: List[str] = []
+    if not path:
+        return names
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            names.append(line)
+    return names
+
+
 def _safe_indices(idx: Sequence[int], n: int) -> np.ndarray:
     idx = np.asarray(idx, dtype=np.int64).reshape(-1)
     if idx.size == 0:
@@ -133,8 +188,25 @@ def _safe_indices(idx: Sequence[int], n: int) -> np.ndarray:
 
 def _opening_surfaces_from_checkpoint(opa_chk: dict):
     surfaces = []
-    rec_v = opa_chk.get("op_rec_v", [])
-    rec_f = opa_chk.get("op_rec_f", [])
+    candidate_pairs = [
+        (opa_chk.get("op_target_rec_v", []), opa_chk.get("op_target_rec_f", [])),
+        (opa_chk.get("op_source_surface_v", []), opa_chk.get("op_source_surface_f", [])),
+        (opa_chk.get("op_rec_v", []), opa_chk.get("op_rec_f", [])),
+    ]
+    rec_v, rec_f = [], []
+    for vv, ff in candidate_pairs:
+        if not (isinstance(vv, list) and isinstance(ff, list) and len(vv) == len(ff) and len(vv) > 0):
+            continue
+        valid_any = False
+        for v, f in zip(vv, ff):
+            v_np = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+            f_np = np.asarray(f, dtype=np.int64).reshape(-1, 3)
+            if v_np.shape[0] >= 3 and f_np.shape[0] >= 1:
+                valid_any = True
+                break
+        if valid_any:
+            rec_v, rec_f = vv, ff
+            break
     if not (isinstance(rec_v, list) and isinstance(rec_f, list)):
         return surfaces
     if len(rec_v) != len(rec_f):
@@ -333,15 +405,48 @@ def _fit_case_sequential(args, label: str, loss_weighting: dict) -> None:
     args.name_target = label
     print('Now performing ghd fitting for case {}'.format(label))
     case_log_root = os.path.join(args.save_root, args.name_target, args.meta)
-    done_markers = [
+    resume_markers = [
         os.path.join(case_log_root, "ghb_fitting_checkpoint.pkl"),
         os.path.join(case_log_root, "ghd_fitting_checkpoint.pkl"),  # backward compatibility
     ]
-    if not any(os.path.exists(path) for path in done_markers):
-        copied_loss_weighting = loss_weighting.copy()
-        fit_ghd(args, copied_loss_weighting, hard_normalize=True, keep_size=True)
-    else:
-        print("Skipping ghd fitting for case {}".format(label))
+    resume_epoch = None
+    for marker in resume_markers:
+        if not os.path.exists(marker):
+            continue
+        try:
+            with open(marker, "rb") as f:
+                chk = pickle.load(f)
+            marker_epoch = chk.get("epoch", None)
+            if marker_epoch is None:
+                continue
+            marker_epoch = int(marker_epoch)
+            resume_epoch = marker_epoch if resume_epoch is None else max(resume_epoch, marker_epoch)
+        except Exception:
+            continue
+
+    target_last_epoch = int(args.epochs) - 1
+    if resume_epoch is not None and resume_epoch >= target_last_epoch:
+        print(
+            "Skipping ghd fitting for case {}: existing checkpoint already reached epoch {} "
+            "(target last epoch {}).".format(label, resume_epoch, target_last_epoch)
+        )
+        return
+
+    if resume_epoch is not None:
+        print(
+            "Resuming ghd fitting for case {} from existing checkpoint epoch {} "
+            "towards target epoch {}.".format(label, resume_epoch, target_last_epoch)
+        )
+
+    copied_loss_weighting = loss_weighting.copy()
+    canonical_chk = getattr(args, "canonical_chk", "") or None
+    fit_ghd(
+        args,
+        copied_loss_weighting,
+        hard_normalize=True,
+        keep_size=bool(getattr(args, "keep_size", 1)),
+        canonical_chk=canonical_chk,
+    )
 
 
 def _parse_parallel_devices(parallel_devices: str, fallback_device: str) -> List[str]:
@@ -438,6 +543,8 @@ parser.add_argument('--root_target', type=str, default=DEFAULTS["root_target"]) 
 parser.add_argument('--name_canonical', type=str, default=DEFAULTS["name_canonical"]) # name of the canonical template mesh, should be a subdirectory of args.root_template, and should contain a file named "mesh_template_p3d.pt" for the template mesh. If registration is not performed, this file will be generated during registration.
 parser.add_argument('--name_target', type=str, default=DEFAULTS["name_target"]) # name of the target mesh, should be a subdirectory of args.root_target, and should contain the registered mesh and the cleaned centreline for the corresponding case if registration is performed. If registration is not performed, these files will be generated during registration.
 parser.add_argument('--case_glob', type=str, default=DEFAULTS["case_glob"]) # wildcard filter for case folders (e.g. p429*)
+parser.add_argument('--exclude_cases_file', type=str, default=DEFAULTS["exclude_cases_file"]) # optional text file with one case name per line to skip during fitting/registration
+parser.add_argument('--include_cases_file', type=str, default=DEFAULTS["include_cases_file"]) # optional text file with one case name per line; only these cases will be fitted
 parser.add_argument('--viz_freq', type=int, default=DEFAULTS["viz_freq"]) # frequency for visualization during fitting, in number of epochs
 parser.add_argument('--chk_freq', type=int, default=None) # frequency for saving checkpoints during fitting, in number of epochs. Should be set such that epochs / chk_freq = chk_num, i.e., the total number of checkpoints saved during fitting is equal to chk_num.
 parser.add_argument('--log_freq', type=int, default=DEFAULTS["log_freq"]) # frequency for logging during fitting, in number of epochs
@@ -450,11 +557,24 @@ parser.add_argument('--plateau_patience', type=int, default=DEFAULTS["plateau_pa
 parser.add_argument('--plateau_threshold', type=float, default=DEFAULTS["plateau_threshold"]) # ReduceLROnPlateau threshold
 parser.add_argument('--plateau_cooldown', type=int, default=DEFAULTS["plateau_cooldown"]) # ReduceLROnPlateau cooldown (epochs)
 parser.add_argument('--min_lr', type=float, default=DEFAULTS["min_lr"]) # minimum learning rate
+parser.add_argument('--resume_override_hparams', type=int, default=DEFAULTS["resume_override_hparams"]) # 1: after loading optimizer/scheduler state, reapply lr and scheduler hyperparameters from the current config
+parser.add_argument('--prefit_guard_enabled', type=int, default=DEFAULTS["prefit_guard_enabled"]) # 1: run a zero-step diagnostic on the resumed/current fit state and soften suspicious opening/centreline supervision
+parser.add_argument('--prefit_opening_p_threshold', type=float, default=DEFAULTS["prefit_opening_p_threshold"]) # moderate threshold for opening boundary mismatch in the prefit guard
+parser.add_argument('--prefit_opening_p_severe_threshold', type=float, default=DEFAULTS["prefit_opening_p_severe_threshold"]) # severe threshold for opening boundary mismatch in the prefit guard
+parser.add_argument('--prefit_opening_surface_p_threshold', type=float, default=DEFAULTS["prefit_opening_surface_p_threshold"]) # moderate threshold for opening cap surface mismatch in the prefit guard
+parser.add_argument('--prefit_opening_surface_p_severe_threshold', type=float, default=DEFAULTS["prefit_opening_surface_p_severe_threshold"]) # severe threshold for opening cap surface mismatch in the prefit guard
+parser.add_argument('--prefit_opening_plane_threshold', type=float, default=DEFAULTS["prefit_opening_plane_threshold"]) # moderate threshold for opening plane mismatch in the prefit guard
+parser.add_argument('--prefit_opening_plane_severe_threshold', type=float, default=DEFAULTS["prefit_opening_plane_severe_threshold"]) # severe threshold for opening plane mismatch in the prefit guard
+parser.add_argument('--prefit_centreline_threshold', type=float, default=DEFAULTS["prefit_centreline_threshold"]) # moderate threshold for centreline mismatch in the prefit guard
+parser.add_argument('--prefit_centreline_severe_threshold', type=float, default=DEFAULTS["prefit_centreline_severe_threshold"]) # severe threshold for centreline mismatch in the prefit guard
 parser.add_argument('--early_stopping', type=int, default=DEFAULTS["early_stopping"]) # 1 enables early stopping
 parser.add_argument('--early_stopping_patience', type=int, default=DEFAULTS["early_stopping_patience"]) # epochs with no sufficient improvement
 parser.add_argument('--early_stopping_min_delta', type=float, default=DEFAULTS["early_stopping_min_delta"]) # minimal improvement to reset patience
 parser.add_argument('--early_stopping_min_epochs', type=int, default=DEFAULTS["early_stopping_min_epochs"]) # warmup epochs before early stopping can trigger
 parser.add_argument('--nonfinite_guard', type=int, default=DEFAULTS["nonfinite_guard"]) # 1: skip optimizer step on non-finite total loss
+parser.add_argument('--keep_size', type=int, default=DEFAULTS["keep_size"]) # 1: normalize target by canonical scale; 0: normalize each mesh by its own scale
+parser.add_argument('--keep_size_factor', type=float, default=DEFAULTS["keep_size_factor"]) # additional multiplier applied to the shared normalization scale when keep_size=1
+parser.add_argument('--grad_clip_norm', type=float, default=DEFAULTS["grad_clip_norm"]) # gradient norm clipping threshold (<=0 disables)
 parser.add_argument('--num_op', type=int, default=DEFAULTS["num_op"]) # number of operators to use for fitting, can be adjusted based on the complexity of the meshes and the desired level of detail in the fitting. More operators may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the loss weights.
 parser.add_argument('--num_Basis', type=int, default=DEFAULTS["num_Basis"]) # number of basis functions to use for fitting, can be adjusted based on the desired level of detail in the fitting.
 parser.add_argument('--mix_lap_weights', type=list, default=DEFAULTS["mix_lap_weights"]) # weights for the mixed Laplacian regularization terms, can be adjusted to balance the smoothness and fidelity of the fitting.
@@ -464,6 +584,7 @@ parser.add_argument('--op_clean_threshold', type=float, default=DEFAULTS["op_cle
 parser.add_argument('--op_bold', type=int, default=DEFAULTS["op_bold"])  # confidence that trimesh offers uniform mesh normal directions
 parser.add_argument('--save_root', type=str, default=DEFAULTS["save_root"]) # root directory for saving fitting results, should contain subdirectories named as args.name_target, each of which contains the fitting results for the corresponding case. The fitting results will be saved in a subdirectory named as args.meta under each target subdirectory, and the checkpoint for each case will be saved as "ghd_fitting_checkpoint.pkl" under the corresponding meta subdirectory.
 parser.add_argument('--meta', type=str, default=DEFAULTS["meta"]) # meta name for saving fitting results, can be adjusted to distinguish different fitting settings. The fitting results will be saved in a subdirectory named as args.meta under each target subdirectory.
+parser.add_argument('--canonical_chk', type=str, default=DEFAULTS["canonical_chk"]) # path to a pickle cache of the canonical eigvec/eigval; if file exists, eigsh is skipped (huge CPU win when fitting many cases)
 parser.add_argument('--epochs', type=int, default=DEFAULTS["epochs"]) # number of epochs for fitting, can be adjusted based on the desired level of detail in the fitting and the computational resources available. More epochs may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the learning rate and loss weights.
 parser.add_argument('--num_sp', type=int, default=DEFAULTS["num_sp"]) # number of spectral components to use for fitting, can be adjusted based on the desired level of detail in the fitting. More spectral components may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the loss weights.
 parser.add_argument('--do_dpi', type=int, default=DEFAULTS["do_dpi"]) # number of iterations for the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the computational resources available. More iterations may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the learning rate and loss weights.
@@ -473,9 +594,19 @@ parser.add_argument('--use_do_dropper', type=int, default=DEFAULTS["use_do_dropp
 parser.add_argument('--attention_max_w', type=float, default=DEFAULTS["attention_max_w"]) # maximum weight for the attention mechanism in the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the characteristics of the meshes. A larger maximum weight may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the learning rate and loss weights.
 parser.add_argument('--attention_smooth', type=float, default=DEFAULTS["attention_smooth"]) # smoothing factor for the attention mechanism in the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the characteristics of the meshes. A larger smoothing factor may help to improve the robustness of the registration by reducing the influence of outliers, but may also require more careful tuning of the learning rate and loss weights.
 parser.add_argument('--do_number', type=int, default=DEFAULTS["do_number"]) # number of points to use for the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the computational resources available. More points may allow for a better fit but may also increase the risk of overfitting and require more careful tuning of the learning rate and loss weights.
+parser.add_argument('--redo_do_points', type=int, default=DEFAULTS["redo_do_points"]) # 1: force regeneration of do_points.pt even if cached points exist
+parser.add_argument('--do_sampling_max_loops', type=int, default=DEFAULTS["do_sampling_max_loops"]) # safety cap for static DO point generation retries before failing with a diagnostic error
 parser.add_argument('--weighter_style', type=str, default=DEFAULTS["weighter_style"]) # style for the weighter in the differentiable point cloud registration, can be adjusted based on the desired level of detail in the fitting and the characteristics of the meshes. Different styles may use different weighting strategies and may require different tuning of the learning rate and loss weights.
+parser.add_argument('--opening_warmup_epochs', type=int, default=DEFAULTS["opening_warmup_epochs"]) # epochs after fit/resume start during which opening and centreline losses ramp from reduced weight to full weight
+parser.add_argument('--opening_start_scale', type=float, default=DEFAULTS["opening_start_scale"]) # starting multiplier for opening boundary loss during warmup
+parser.add_argument('--opening_surface_start_scale', type=float, default=DEFAULTS["opening_surface_start_scale"]) # starting multiplier for opening cap surface loss during warmup
+parser.add_argument('--opening_normal_start_scale', type=float, default=DEFAULTS["opening_normal_start_scale"]) # starting multiplier for opening normal loss during warmup
+parser.add_argument('--opening_plane_start_scale', type=float, default=DEFAULTS["opening_plane_start_scale"]) # starting multiplier for opening plane loss during warmup
+parser.add_argument('--opening_rim_start_scale', type=float, default=DEFAULTS["opening_rim_start_scale"]) # starting multiplier for opening rim curvature loss during warmup
+parser.add_argument('--centreline_start_scale', type=float, default=DEFAULTS["centreline_start_scale"]) # starting multiplier for differentiable centreline loss during warmup
 parser.add_argument('--opening_match_mode', type=str, default=DEFAULTS["opening_match_mode"]) # opening branch matching mode: permutation | index
 parser.add_argument('--opening_normal_bidirectional', type=int, default=DEFAULTS["opening_normal_bidirectional"]) # if 1, opening normal loss is sign-invariant
+parser.add_argument('--opening_loss_mode', type=str, default=DEFAULTS["opening_loss_mode"]) # opening point loss domain: surface | boundary | rim_plane | rim_ordered
 parser.add_argument('--mesh_filename', type=str, default=DEFAULTS["mesh_filename"]) # mesh filename inside each target subfolder (e.g., part_aligned.obj). If not found, falls back to <root>/<label>.obj
 parser.add_argument('--redo_registration', type=int, default=DEFAULTS["redo_registration"]) # force regeneration of opening/centreline checkpoints
 parser.add_argument('--auto_opening_method', type=str, default=DEFAULTS["auto_opening_method"]) # normals | legacy
@@ -489,8 +620,24 @@ parser.add_argument('--render_auto_registration', type=int, default=DEFAULTS["re
 parser.add_argument('--render_auto_registration_only', type=int, default=DEFAULTS["render_auto_registration_only"]) # stop after auto registration rendering
 parser.add_argument('--render_auto_registration_overwrite', type=int, default=DEFAULTS["render_auto_registration_overwrite"]) # overwrite existing render pngs
 parser.add_argument('--render_auto_registration_dir', type=str, default=DEFAULTS["render_auto_registration_dir"]) # output dir for auto registration render pngs
+parser.add_argument('--roundrobin_step', type=int, default=DEFAULTS["roundrobin_step"]) # if >0, cycle through all cases with this many epochs per round before continuing
 parser.add_argument('--parallel_cases', type=int, default=DEFAULTS["parallel_cases"]) # number of cases to fit in parallel via subprocesses
 parser.add_argument('--parallel_devices', type=str, default=DEFAULTS["parallel_devices"]) # comma-separated device list used round-robin for parallel cases
+# --- Decap chamfer ---
+parser.add_argument('--decap_chamfer', type=int, default=DEFAULTS["decap_chamfer"]) # 1: exclude cap faces from loss_p0 surface chamfer
+parser.add_argument('--decap_chamfer_rings', type=int, default=DEFAULTS["decap_chamfer_rings"]) # N-ring expansion of rim vertex set before cap-face removal (0 = exact cap only)
+# --- Local rim vertex refinement (Stage 2) ---
+parser.add_argument('--rim_refine_enabled', type=int, default=DEFAULTS["rim_refine_enabled"]) # 1: enable local rim vertex refinement after spectral fitting
+parser.add_argument('--rim_refine_epochs', type=int, default=DEFAULTS["rim_refine_epochs"]) # number of epochs for rim refinement
+parser.add_argument('--rim_refine_lr', type=float, default=DEFAULTS["rim_refine_lr"]) # learning rate for rim refinement
+parser.add_argument('--rim_refine_rings', type=int, default=DEFAULTS["rim_refine_rings"]) # N-ring neighbourhood around opening cap vertices
+parser.add_argument('--rim_refine_laplacian_weight', type=float, default=DEFAULTS["rim_refine_laplacian_weight"]) # laplacian smoothing weight during refinement
+parser.add_argument('--rim_refine_edge_weight', type=float, default=DEFAULTS["rim_refine_edge_weight"]) # edge length preservation weight during refinement
+parser.add_argument('--rim_refine_opening_p_weight', type=float, default=DEFAULTS["rim_refine_opening_p_weight"]) # opening boundary chamfer weight during refinement
+parser.add_argument('--rim_refine_opening_plane_weight', type=float, default=DEFAULTS["rim_refine_opening_plane_weight"]) # opening plane alignment weight during refinement
+parser.add_argument('--rim_refine_surface_p_weight', type=float, default=DEFAULTS["rim_refine_surface_p_weight"]) # opening surface chamfer weight during refinement
+parser.add_argument('--rim_refine_grad_clip_norm', type=float, default=DEFAULTS["rim_refine_grad_clip_norm"]) # gradient clip norm for refinement
+parser.add_argument('--rim_refine_on_suspicious_only', type=int, default=DEFAULTS["rim_refine_on_suspicious_only"]) # 1: only run local rim refinement on cases flagged by the prefit guard
 
 pre_args, _ = parser.parse_known_args()
 config_path = pre_args.config
@@ -522,7 +669,26 @@ label_list = [label for label in os.listdir(args.root_target) if
 case_glob = str(getattr(args, "case_glob", "*"))
 if case_glob and case_glob != "*":
     label_list = [label for label in label_list if fnmatch.fnmatch(label, case_glob)]
-exclude_list = []
+include_file = str(getattr(args, "include_cases_file", "") or "").strip()
+if include_file:
+    include_names = set(_load_case_name_file(include_file))
+    if include_names:
+        before = len(label_list)
+        label_list = [label for label in label_list if label in include_names]
+        print(
+            f"Included {len(label_list)}/{before} case(s) using include file: "
+            f"{include_file}"
+        )
+exclude_file = str(getattr(args, "exclude_cases_file", "") or "").strip()
+if exclude_file:
+    exclude_names = set(_load_case_name_file(exclude_file))
+    if exclude_names:
+        before = len(label_list)
+        label_list = [label for label in label_list if label not in exclude_names]
+        print(
+            f"Excluded {before - len(label_list)} case(s) using exclude file: "
+            f"{exclude_file}"
+        )
 random.shuffle(label_list)
 mesh_filename = getattr(args, "mesh_filename", None)
 if mesh_filename:
@@ -595,7 +761,13 @@ if register:
                 print("Registration for case {} will be recomputed (--redo_registration=1)".format(label))
             else:
                 print("Registration for case {} not found".format(label))
-            target = RegistrationwOpeningAlignmentwDifferentiableCentreline(args, args.root_target, args.name_target)
+            target = RegistrationwOpeningAlignmentwDifferentiableCentreline(
+                args,
+                args.root_target,
+                args.name_target,
+                num_op=int(args.num_op),
+                num_cep=int(args.num_op),
+            )
             redo_opa = bool(redo_registration or (not has_opa))
             # Keep centreline consistent with refreshed openings.
             redo_cl = bool(redo_registration or (not has_cl) or redo_opa)
@@ -626,9 +798,23 @@ if bool(getattr(args, "render_auto_registration", 0)):
         raise SystemExit(0)
 
 # perform ghd fitting
+import math as _math
 parallel_cases = max(1, int(getattr(args, "parallel_cases", 1)))
+roundrobin_step = int(getattr(args, "roundrobin_step", 0))
 if parallel_cases > 1 and len(label_list) > 1:
     _fit_cases_parallel(args=args, labels=label_list, passthrough_argv=sys.argv[1:])
+elif roundrobin_step > 0:
+    total_epochs = int(args.epochs)
+    num_rounds = _math.ceil(total_epochs / roundrobin_step)
+    for rnd in range(num_rounds):
+        round_target = min((rnd + 1) * roundrobin_step, total_epochs)
+        args.epochs = round_target
+        args.chk_freq = max(1, round(round_target / chk_num))
+        print(f"\n{'='*60}")
+        print(f"Round-robin round {rnd+1}/{num_rounds}  |  epochs target: {round_target}")
+        print(f"{'='*60}\n")
+        for label in label_list:
+            _fit_case_sequential(args, label, loss_weighting)
 else:
     for label in label_list:
         _fit_case_sequential(args, label, loss_weighting)

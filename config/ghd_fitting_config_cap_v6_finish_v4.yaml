@@ -1,0 +1,130 @@
+# Cap-v6 finish: continue per-case fitting from copied 1500-epoch round-robin
+# checkpoints to full convergence (or early stop). NO round-robin.
+# Runs in parallel with the original roundrobin job (separate save_root).
+
+register: 0
+chk_num: 4
+epochs: 4000
+
+# Main args
+device: cuda:0
+root_template: /workspace/AneuG/checkpoints
+root_target: /data/ghd_prepared_meshes_3_aneurysm_1op_new
+name_canonical: canonical_average
+name_target: item_Case7
+case_glob: "*"
+
+include_cases_file: /workspace/AneuG/config/cap_v6_finish_v3_noitem_include.txt
+
+# Eigenvector cache (shared with roundrobin run, read-only).
+canonical_chk: /workspace/AneuG/checkpoints/canonical_average/eigen_chk_144.pkl
+
+# No round-robin: finish each case to full epochs (or early stop).
+roundrobin_step: 0
+
+viz_freq: 500
+chk_freq: null
+log_freq: 400
+
+lr: 0.0025
+lr_scheduler: step
+step_size: 1800
+gamma: 0.8
+prefit_guard_enabled: 1
+prefit_opening_p_threshold: 0.14
+prefit_opening_p_severe_threshold: 0.28
+prefit_opening_surface_p_threshold: 0.012
+prefit_opening_surface_p_severe_threshold: 0.03
+prefit_opening_plane_threshold: 0.045
+prefit_opening_plane_severe_threshold: 0.09
+prefit_centreline_threshold: 0.18
+prefit_centreline_severe_threshold: 0.30
+
+early_stopping: 1
+early_stopping_patience: 120
+early_stopping_min_delta: 0.0002
+early_stopping_min_epochs: 1200
+nonfinite_guard: 1
+
+keep_size: 0
+grad_clip_norm: 1.0
+
+num_op: 1
+num_Basis: 144
+mix_lap_weights:
+  - 1.0
+  - 0.1
+  - 0.1
+sample_num: 140000
+op_sample_num: 1200
+op_clean_threshold: 0.2
+op_bold: 0
+
+# NEW save_root with the snapshot of 1500-epoch chk dirs already populated.
+save_root: /workspace/AneuG/checkpoints/ghd_fitting_prepared3_aneurysm_1op_cap_v6_finish_v3
+# Keep meta name identical to roundrobin so resume picks up the copied chk.
+meta: prepared3_aneurysm_1op_quality_cap_v6_roundrobin_v3
+
+num_sp: 2
+do_dpi: 4
+do_style: number_control_v2
+do_loss_type: dice_loss_attention
+use_do_dropper: 0
+attention_max_w: 3.0
+attention_smooth: 0.02
+do_number: 12000
+weighter_style: strategy_v2_robust_opening
+opening_warmup_epochs: 500
+opening_start_scale: 0.45
+opening_surface_start_scale: 0.45
+opening_normal_start_scale: 0.55
+opening_plane_start_scale: 0.18
+opening_rim_start_scale: 0.30
+centreline_start_scale: 0.22
+opening_match_mode: index
+opening_normal_bidirectional: 1
+opening_loss_mode: boundary
+decap_chamfer: 1
+mesh_filename: part_aligned.obj
+
+redo_registration: 0
+auto_opening_method: normals
+auto_registration_mode: load_or_compute
+opa_checkpoint_name: opa_checkpoint_1op
+centreline_checkpoint_name: diff_centreline_checkpoint_1op
+
+render_auto_registration: 0
+render_auto_registration_only: 0
+render_auto_registration_overwrite: 0
+render_auto_registration_dir: /workspace/AneuG/checkpoints/auto_registration_qc_prepared3_aneurysm_1op
+
+# Run 3 cases in parallel on cuda:0 (~60 GB each peak, B200 has 178 GB) → max speedup.
+parallel_cases: 3
+parallel_devices: "cuda:0"
+
+rim_refine_enabled: 1
+rim_refine_on_suspicious_only: 1
+rim_refine_epochs: 160
+rim_refine_lr: 0.0007
+rim_refine_rings: 2
+rim_refine_laplacian_weight: 0.12
+rim_refine_edge_weight: 0.08
+rim_refine_opening_p_weight: 12.0
+rim_refine_opening_plane_weight: 8.0
+rim_refine_surface_p_weight: 2.0
+rim_refine_grad_clip_norm: 0.5
+
+loss_weighting:
+  loss_do: 1.25
+  loss_p0: 1.5
+  loss_n1: 0.8
+  loss_laplacian: 0.12
+  loss_edge: 0.12
+  loss_consistency: 0.12
+  loss_rigid: 12.0
+  loss_openings_p: 8.0
+  loss_openings_surface_p: 2.5
+  loss_openings_n: 0.01
+  loss_openings_plane: 20.0
+  loss_diff_centreline: 1.0
+  loss_thickness: 0.05
