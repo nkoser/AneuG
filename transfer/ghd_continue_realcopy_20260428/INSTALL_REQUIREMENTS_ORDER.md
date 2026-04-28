@@ -41,6 +41,22 @@ conda install -c conda-forge open3d=0.18.0 vtk=9.2.6 pyvista=0.47.0 -y
 
 Danach den pip-Befehl für `requirements_main_packages.txt` nochmal ausführen.
 
+## Hinweis fuer NVIDIA 525 / CUDA 12.0 Server
+
+Wenn der Zielserver nur NVIDIA-Treiber 525 und CUDA 12.0 meldet, nimm zuerst die
+konservativere CUDA-12.6-Variante:
+
+```bash
+python -m pip install -r /workspace/AneuG/transfer/ghd_continue_realcopy_20260428/requirements_torch_cuda126.txt
+python -m pip install -r /workspace/AneuG/transfer/ghd_continue_realcopy_20260428/requirements_pyg_torch28_cuda126.txt
+```
+
+Siehe auch:
+
+```text
+/workspace/AneuG/transfer/ghd_continue_realcopy_20260428/CUDA_525_DRIVER_NOTE.md
+```
+
 ## 3. PyTorch CUDA 12.8 installieren
 
 ```bash
